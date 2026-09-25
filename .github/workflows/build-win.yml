@@ -73,6 +73,8 @@ jobs:
         shell: bash
         env:
           WORKDADDY_BUILD_VERSION: ${{ steps.ver.outputs.version }}
+          # runner 系统区域为 en-US(cp1252)，Python stdout 打印中文会 UnicodeEncodeError
+          PYTHONIOENCODING: utf-8
         run: bash scripts/build-win-zip.sh
 
       - name: 安装 Inno Setup
