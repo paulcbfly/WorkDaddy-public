@@ -36,7 +36,7 @@ jobs:
         shell: bash
         run: |
           for f in scripts/*.cmd; do
-            if ! grep -q $'\r' "$f"; then
+            if ! node -e "process.exit(require('fs').readFileSync(process.argv[1]).includes(0x0d)?0:1)" "$f"; then
               echo "::error::$f 不是 CRLF，无法在 Windows 使用，请转换"
               exit 1
             fi
