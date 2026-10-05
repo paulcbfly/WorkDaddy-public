@@ -48,7 +48,7 @@ if (process.platform === 'win32') {
   }
 }
 const { captureMessage, captureException } = require('./sentry-report.js');
-const { getProfile, profileDataDir } = require('./profiles.js');
+const { getProfile, profileDataDir, isCodeBuddyBinary } = require('./profiles.js');
 const { isTargetForProfile } = require('./cdp-targets.js');
 const { replaceFileWithRetry } = require('./atomic-file-write.js');
 const { parseUiPortState, profileUiPortCandidates } = require('./ui-port.js');
@@ -84,6 +84,7 @@ const cliCdpPort = process.argv.find((arg) => /^--cdp-port=\d+$/i.test(arg));
 const HAS_EXPLICIT_CDP_PORT = Boolean(process.env.WBSWITCH_CDP_PORT || cliCdpPort);
 let CDP_PORT = parseInt(process.env.WBSWITCH_CDP_PORT || (cliCdpPort ? cliCdpPort.split('=')[1] : '') || String(DEFAULT_CDP_PORT), 10);
 process.env.WBSWITCH_CDP_PORT = String(CDP_PORT);
+let CDP_PORT_DYNAMIC = false;
 const CDP_PORT_FILE = path.join(DATA_DIR, 'cdp-port.json');
 // 便携版/低速磁盘上的 WorkBuddy 首次启动可能超过 20 秒；超时只应在足够长的窗口后报告。
 const CDP_STARTUP_TIMEOUT_MS = 60000;
@@ -248,7 +249,7 @@ function cdpPortCandidates() {
   const result = [];
   const profilePorts = PROFILE_CDP_PORTS[PROFILE.id] || [DEFAULT_CDP_PORT];
   const add = (port) => { if (validCdpPort(port) && !result.includes(port)) result.push(port); };
-  if (HAS_EXPLICIT_CDP_PORT || profilePorts.includes(CDP_PORT)) add(CDP_PORT);
+  if (HAS_EXPLICIT_CDP_PORT || profilePorts.includes(CDP_PORT) || CDP_PORT_DYNAMIC) add(CDP_PORT);
   const savedPort = readCdpPortFile();
   if (profilePorts.includes(savedPort)) add(savedPort);
   for (const port of profilePorts) add(port);
@@ -283,6 +284,23 @@ function isLocalPortAvailable(port) {
   });
 }
 
+function reserveEphemeralCdpPort() {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    let settled = false;
+    const finish = (port) => {
+      if (settled) return;
+      settled = true;
+      try { server.close(() => resolve(validCdpPort(port) ? port : 0)); } catch (_) { resolve(validCdpPort(port) ? port : 0); }
+    };
+    server.once('error', () => finish(0));
+    server.listen({ host: HOST, port: 0 }, () => {
+      const address = server.address();
+      finish(address && typeof address === 'object' ? Number(address.port) : 0);
+    });
+  });
+}
+
 function httpGet(port, p, headers = {}) {
   return new Promise((resolve) => {
     const req = http.get({ host: HOST, port, path: p, headers, timeout: 1500 }, (res) => {
@@ -314,6 +332,10 @@ async function isWorkBuddyCdp() {
 }
 
 async function isWorkBuddyCdpAt(port, binary = null) {
+  if (PROFILE.nativeDebugPort) {
+    const native = await httpGet(PROFILE.nativeDebugPort, '/json/list');
+    if (!native || native.status !== 200) return false;
+  }
   const [version, targets] = await Promise.all([
     httpGet(port, '/json/version'),
     httpGet(port, '/json/list'),
@@ -352,7 +374,16 @@ async function configureCdpPort() {
       return port;
     }
   }
-  throw new Error('当前 profile 的 CDP 端口均被占用，无法启动 WorkBuddy');
+  const ephemeralPort = await reserveEphemeralCdpPort();
+  if (ephemeralPort) {
+    CDP_PORT = ephemeralPort;
+    CDP_PORT_DYNAMIC = true;
+    process.env.WBSWITCH_CDP_PORT = String(ephemeralPort);
+    writeCdpPortFile(ephemeralPort);
+    log('固定 CDP 端口均不可用，选择系统动态端口: ' + ephemeralPort);
+    return ephemeralPort;
+  }
+  throw new Error('当前 profile 的固定 CDP 端口均不可用，且无法分配备用端口，无法启动 WorkBuddy');
 }
 
 function strictPowerShellLines(cmd) {
@@ -394,7 +425,7 @@ function getWorkBuddyProcesses() {
     requireCurrentOwner: true,
     requireNativeArguments: true,
     allowTransientNotFound: true,
-  });
+  }).filter(row => PROFILE.kind !== 'codebuddy' || isCodeBuddyBinary(row.ExecutablePath,PROFILE.id));
 }
 
 // 仅保留为本地端口诊断；daemon 启动成功必须走 exactDaemonStatus 完整身份校验。
@@ -560,7 +591,8 @@ function findWorkBuddy() {
       const candidate = String(p || '').trim().replace(/^"(.*)"(?:,\d+)?$/, '$1').replace(/,\d+$/, '');
       if (!candidate || !fs.existsSync(candidate)) return null;
       const resolved = resolveWindowsExecutable(candidate);
-      return PROFILE_BINARY_NAMES.has(path.win32.basename(resolved).toLowerCase()) ? resolved : null;
+      return PROFILE_BINARY_NAMES.has(path.win32.basename(resolved).toLowerCase()) &&
+        (PROFILE.kind !== 'codebuddy' || isCodeBuddyBinary(resolved,PROFILE.id)) ? resolved : null;
     } catch (_) {}
     return null;
   };
@@ -1112,6 +1144,7 @@ async function quitWorkBuddy(binary) {
 function launchWorkBuddy(wb) {
   const environmentMode = !!(PROFILE.cdp && PROFILE.cdp.mode === 'environment');
   const args = environmentMode ? [] : ['--remote-debugging-port=' + CDP_PORT];
+  if (PROFILE.nativeDebugPort) args.push('--inspect=127.0.0.1:' + PROFILE.nativeDebugPort);
   const env = environmentMode
     ? { ...process.env, WORKBUDDY_REMOTE_DEBUGGING_PORT: String(CDP_PORT) }
     : process.env;
@@ -1363,7 +1396,7 @@ function findWorkBuddyNative() {
   if (process.env.WBSWITCH_WORKBUDDY_DIR) {
     for (const name of expectedNames) add(path.join(process.env.WBSWITCH_WORKBUDDY_DIR, name), 'explicit');
   }
-  const appPathNames = PROFILE.customTarget ? [] : (PROFILE.id === 'workbuddy-ai' ? ['WorkBuddyAI.exe'] : ['WorkBuddy.exe']);
+  const appPathNames = PROFILE.customTarget ? [] : (PROFILE.kind === 'codebuddy' ? ['CodeBuddy.exe'] : (PROFILE.id === 'workbuddy-ai' ? ['WorkBuddyAI.exe'] : ['WorkBuddy.exe']));
   const appPathKeys = [];
   for (const name of appPathNames) {
     appPathKeys.push(`HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${name}`);
@@ -1371,9 +1404,11 @@ function findWorkBuddyNative() {
   }
   const appPathCommand = "$k=@(" + appPathKeys.map(powershellLiteral).join(',') + "); Get-ItemProperty $k -ErrorAction SilentlyContinue | ForEach-Object { if ($_.'(default)') { $_.'(default)' } elseif ($_.Path) { Join-Path $_.Path " + powershellLiteral(expectedName) + " } }";
   for (const candidate of bestEffortPowerShellLines(appPathCommand, 'App Paths')) add(candidate, 'registered');
-  const uninstallCommand = "$k=@('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'WorkBuddy' } | ForEach-Object { if($_.DisplayIcon){ ($_.DisplayIcon -replace ',.*$','').Trim() } elseif($_.InstallLocation){ Join-Path $_.InstallLocation " + powershellLiteral(expectedName) + " } }";
+  const uninstallCommand = "$k=@('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'WorkBuddy|CodeBuddy' } | ForEach-Object { if($_.DisplayIcon){ ($_.DisplayIcon -replace ',.*$','').Trim() } elseif($_.InstallLocation){ Join-Path $_.InstallLocation " + powershellLiteral(expectedName) + " } }";
   for (const candidate of bestEffortPowerShellLines(uninstallCommand, '卸载注册表')) add(candidate, 'registered');
-  if (PROFILE.id === 'workbuddy-ai') {
+  if (PROFILE.kind === 'codebuddy') {
+    for(const root of [path.join(local,'Programs'),programFiles,programFilesX86]) add(path.join(root,PROFILE.name,'CodeBuddy.exe'),'portable');
+  } else if (PROFILE.id === 'workbuddy-ai') {
     add(path.join(local, 'Programs', 'WorkBuddyAI', 'WorkBuddyAI.exe'), 'portable');
     add(path.join(local, 'Programs', 'WorkBuddy AI', 'WorkBuddyAI.exe'), 'portable');
     add(path.join(programFiles, 'WorkBuddyAI', 'WorkBuddyAI.exe'), 'portable');
@@ -1390,7 +1425,9 @@ function findWorkBuddyNative() {
     add(path.join(root, 'Software', PROFILE.id === 'workbuddy-ai' ? 'workbuddy-ai' : 'workbuddy', expectedName), 'portable');
     add(path.join(root, PROFILE.id === 'workbuddy-ai' ? 'WorkBuddyAI' : 'WorkBuddy', expectedName), 'portable');
   }
-  const scanDirs = PROFILE.id === 'workbuddy-ai'
+  const scanDirs = PROFILE.kind === 'codebuddy'
+    ? [path.join(local,'Programs',PROFILE.name),path.join(local,PROFILE.name),path.join(programFiles,PROFILE.name)]
+    : PROFILE.id === 'workbuddy-ai'
     ? [path.join(local, 'Programs', 'WorkBuddyAI'), path.join(local, 'Programs', 'WorkBuddy AI'), path.join(local, 'WorkBuddyAI')]
     : [path.join(local, 'Programs', 'WorkBuddy'), path.join(local, 'WorkBuddy'), path.join(process.env.APPDATA || '', 'WorkBuddy')];
   const scanCommand = [
@@ -1405,6 +1442,7 @@ function findWorkBuddyNative() {
     try {
       if (!fs.statSync(item.path).isFile()) continue;
       if (!PROFILE_BINARY_NAMES.has(path.win32.basename(item.path).toLowerCase())) continue;
+      if (PROFILE.kind === 'codebuddy' && !isCodeBuddyBinary(item.path,PROFILE.id)) continue;
       if (PROFILE.configuredTarget &&
           !sameWindowsPath(path.win32.dirname(item.path), path.win32.dirname(PROFILE.appPath))) continue;
       summary.validCandidateCount += 1;
@@ -1788,4 +1826,5 @@ module.exports = {
   tasklistProcessIds,
   workBuddyRunning,
   cdpPortCandidates,
+  reserveEphemeralCdpPort,
 };

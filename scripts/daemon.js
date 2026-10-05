@@ -28,7 +28,8 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const net = require('net');
-const sessionSync = require('./session-sync.js');
+let sessionSync = require('./session-sync.js');
+const {createCodeBuddyFiles} = require('./codebuddy-files.js');
 const { createAccountCreditCache } = require('./account-credit-cache.js');
 const { spawn, spawnSync } = require('child_process');
 const {
@@ -126,6 +127,7 @@ const {
   checkinDisplayValue,
   getAccountOrder,
   setAccountOrder,
+  setAccountNote,
 } = require('./lib.js');
 const { createThirdPartyImport } = require('./third-party-models.js');
 const { extractCreditSegments, sortCreditSegments, mergeCreditSegments, parseEnterpriseUsage, ENTERPRISE_EDITIONS } = require('./credit-segments.js');
@@ -155,10 +157,13 @@ const {
   telemetryEnvironmentOverride,
 } = require('./sentry-report.js');
 const { createUsageReporter } = require('./usage-report.js');
-const { getProfile, profileDataDir, listInstalledModelSources } = require('./profiles.js');
+const { getProfile, profileDataDir, listInstalledModelSources, sharedDataDir } = require('./profiles.js');
 const plat = require('./platform.js');
 const { readWorkBuddyTarget } = require('./workbuddy-target.js');
-const { classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile } = require('./cdp-targets.js');
+const { BINDING, createRendererApiBridge, rendererBridgeSource } = require('./renderer-api-bridge.js');
+const { createCodeBuddyNative } = require('./codebuddy-native.js');
+const { createCodeBuddySessionStore } = require('./codebuddy-session-store.js');
+const { classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile, selectPageTarget, selectIdeTargets } = require('./cdp-targets.js');
 const { createSessionDb, normalizeSessionIdBatch, parameterCount } = require('./session-db.js');
 const { createDirtyIndex } = require('./session-dirty.js');
 const {
@@ -168,7 +173,7 @@ const {
   requiredPassword,
   resolveArchiveTarget,
 } = require('./secure-transfer.js');
-const { writeSessionTransfer, readSessionTransfer, receiveSessionUpload } = require('./session-transfer.js');
+const { writeSessionTransfer, readSessionTransfer, receiveSessionUpload, createSessionExportJobs } = require('./session-transfer.js');
 const { forkedTitle, planForkAtMessage } = require('./session-fork.js');
 const { pipeline: transferPipeline } = require('node:stream/promises');
 const { replaceFileWithRetry } = require('./atomic-file-write.js');
@@ -197,6 +202,7 @@ const {
   isTaskCompatible,
   configureAutomationRuntime,
   installBuiltinTask,
+  removeBuiltinTasks,
 } = require('./automation.js');
 
 const { assertAccountRequestUrl, createTaskState, cancellableWait, createRendererGate, probeSessionReceipt, receiptComplete } = require('./automation-runtime.js');
@@ -215,6 +221,9 @@ const { runCompletionReport, probeAccountCompletion } = require('./completion-re
 const { createPrimaryAccountStore } = require('./primary-account.js');
 const PROFILE = getProfile();
 const DATA_DIR = defaultDataDir();
+const codeBuddyFiles = PROFILE.kind === 'codebuddy' ? createCodeBuddyFiles({root: PROFILE.historyRoot, sync:sessionSync}) : null;
+if (codeBuddyFiles) sessionSync = codeBuddyFiles.sync;
+const codeBuddyNative = PROFILE.kind === 'codebuddy' ? createCodeBuddyNative({profile: PROFILE, WebSocketCtor}) : null;
 const accountCreditCache = createAccountCreditCache(DATA_DIR);
 const thirdPartyModels = createThirdPartyImport({ targetFile: workbuddyModelsFile(), dataDir: DATA_DIR });
 const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.existsSync(accountBackupFile(uid)));
@@ -420,12 +429,23 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 // 1.2.145：识别仅 updated_at 的激活漂移，清除无变更脏标记；无结果任务不再弹同步进度窗口。
 // 1.2.126：5.6 加密账号改为密文原样备份、内存解密；导入兼容明文 token，
 //          刷新结果不把解密后的 token 写回加密备份。
-const DAEMON_VERSION = '1.2.153';
-const DAEMON_BUILD_ID = 'release-1.2.153-20260924-respect-active-session-sync-rule';
+// 1.2.188：关闭主题接管时跟随 WorkBuddy AI 的原生 agent-ui-theme，避免旧快照覆盖官方浅色/深色选择。
+// 1.2.189：毛玻璃底色等待移至 daemon，避免后台页面定时器节流拖延开关和壁纸加载。
+// 1.2.191：CodeDaddy 共用完整面板，通过本机 CDP 适配通信、原生登录态和会话缓存。
+// 1.2.10：合并会话、用量、启动器及 CodeBuddy IDE 注入重试与积分刷新修复。
+// 1.2.11：IDE workbench 共用完整面板后修正浮层确认探针（认 .wbs-root）；
+//         原生账号菜单去重样式移入完整面板注入路径，修复"多个头像"回归。
+// 1.2.11：手动同步（copy/migrate）当前账号后 Page.reload IDE workbench——
+//         扩展宿主 indexCache（TTL 5min）不因外部写 index.json 失效，侧边栏
+//         此前要等缓存过期或重启才显示同步的会话。
+// 1.2.11：账号切换刷新只依赖页面重载与同步完成后的列表刷新，避免官方列表重复合并。
+const DAEMON_VERSION = '1.2.11';
+const DAEMON_BUILD_ID = 'release-1.2.11-20261001-account-reload-list-codebuddy-pr345';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
-  dataDir: DATA_DIR,
+  // Public source metadata is shared; compatibility and installed tasks stay profile-specific.
+  dataDir: sharedDataDir(),
   runtime: { version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform },
 });
 const automationLikes = createAutomationLikesClient({
@@ -439,7 +459,12 @@ const IS_WIN = process.platform === 'win32';
 const IS_MAC = process.platform === 'darwin';
 const IS_LINUX = process.platform === 'linux';
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
-const WORKDADDY_INSTALL_NAME = PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy AI' : 'WorkDaddy';
+const WORKDADDY_INSTALL_NAME = PROFILE.appName || (PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy AI' : 'WorkDaddy');
+const sessionExportJobs = createSessionExportJobs({
+  prepare: prepareSessionExport,
+  directory: () => path.join(process.env.WBSWITCH_LAUNCH_HOME || os.homedir(), 'Downloads', WORKDADDY_INSTALL_NAME),
+  brand: WORKDADDY_INSTALL_NAME,
+});
 const WORKDADDY_DIR_WIN = process.env.WBSWITCH_APP_DIR || path.resolve(__dirname, '..');
 const IS_PORTABLE_WIN = IS_WIN && fs.existsSync(path.join(WORKDADDY_DIR_WIN, 'WorkDaddy.portable'));
 const UI_PORT_BASE = parseInt(process.env.WBSWITCH_PORT || String(profileUiPortCandidates(PROFILE.id)[0]), 10);
@@ -499,6 +524,7 @@ function loadApiToken() {
 }
 
 const API_TOKEN = loadApiToken();
+const handleRendererApiBinding = createRendererApiBridge({token: API_TOKEN, port: () => ACTUAL_PORT, send: cdpSend});
 
 // 遥测开关统一控制远程 Sentry 与本地脱敏渲染器诊断；每次读取都能响应关于页的即时修改。
 let diagnosticsState = { value: null, checkedAt: 0 };
@@ -824,21 +850,14 @@ function selectUpdateAsset(source, rel) {
     typeof a.browser_download_url === 'string' &&
     a.browser_download_url.startsWith(source.downloadRoot + '/')
   );
-  const profileAsset = PROFILE.id === 'workbuddy-ai'
-    ? /^(?:WorkDaddy-AI-Setup-|WorkDaddy-AI-).*\.(?:exe|zip|dmg)$/i
-    : /^WorkDaddy-(?!AI-)(?:Setup-|).*\.(?:exe|zip|dmg)$/i;
-  const profileSetup = PROFILE.id === 'workbuddy-ai'
-    ? /^WorkDaddy-AI-Setup-\d+\.\d+\.\d+\.exe$/i
-    : /^WorkDaddy-Setup-\d+\.\d+\.\d+\.exe$/i;
-  const profileZip = PROFILE.id === 'workbuddy-ai'
-    ? /^WorkDaddy-AI-\d+\.\d+\.\d+-win64\.zip$/i
-    : /^WorkDaddy-\d+\.\d+\.\d+-win64\.zip$/i;
+  const packageName = PROFILE.packageName || ({'workbuddy-cn':'WorkDaddy','workbuddy-ai':'WorkDaddy-AI','codebuddy-cn':'CodeDaddy-CN','codebuddy-intl':'CodeDaddy'})[PROFILE.id];
+  if (!packageName) return null;
+  const matches = (asset, suffix) => asset.name.startsWith(packageName + '-') &&
+    new RegExp('^' + packageName + '-' + suffix + '$', 'i').test(asset.name);
   return IS_WIN
-    ? (assets.find((a) => profileSetup.test(a.name || '')) ||
-       assets.find((a) => profileZip.test(a.name || '')) ||
-       assets.find((a) => profileAsset.test(a.name || '') && /\.(?:exe|zip)$/i.test(a.name || '')) || null)
-    : (assets.find((a) => profileAsset.test(a.name || '') && /\.dmg$/i.test(a.name || '')) ||
-       assets.find((a) => /\.dmg$/i.test(a.name || '') && (PROFILE.id !== 'workbuddy-ai' || !/WorkDaddy-AI-/i.test(a.name || ''))) || null);
+    ? (assets.find(a=>matches(a, 'Setup-\\d+\\.\\d+\\.\\d+\\.exe')) ||
+       assets.find(a=>matches(a, '\\d+\\.\\d+\\.\\d+-win64\\.zip')) || null)
+    : (assets.find(a=>matches(a, '\\d+\\.\\d+\\.\\d+\\.dmg')) || null);
 }
 
 function makeUpdateCandidate(source, rel, order) {
@@ -961,7 +980,7 @@ function downloadUpdateInternal() {
   updateState.downloadRate = 0;
   updateState.etaSeconds = null;
   const ext = IS_WIN ? (/\.exe$/i.test(updateState.assetName || '') ? '.exe' : '.zip') : '.dmg';
-  const updatePrefix = PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy-AI-' : 'WorkDaddy-';
+  const updatePrefix = (PROFILE.packageName || (PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy-AI' : 'WorkDaddy')) + '-';
   const target = path.join(UPDATE_DIR, updatePrefix + updateState.latest + ext);
   const tempTarget = target + '.part.' + process.pid + '.' + crypto.randomBytes(8).toString('hex');
   const expectSha = expectedUpdateSha256();
@@ -1179,7 +1198,7 @@ function validateUpdateArtifact(file, expectSha = null) {
 // 各客户端 API host 与 auth.domain 一致：国内版 www.workbuddy.cn / codebuddy.cn，
 // 国际版（WorkBuddy AI / CodeBuddy 国际版）为 www.workbuddy.ai / www.codebuddy.ai。
 // 签到、积分查询、无感登录必须打到自己对应域名的接口，不能复用国内 host。
-const WB_API_ENDPOINT = PROFILE.apiHost || 'https://www.workbuddy.cn';
+const WB_API_ENDPOINT = PROFILE.authApiHost || PROFILE.apiHost || 'https://www.workbuddy.cn';
 const WB_API_PREFIX = '/v2/plugin';
 const OAUTH_TIMEOUT_SECONDS = 600;
 const OAUTH_RESULT_RETENTION_SECONDS = 300;
@@ -1370,7 +1389,7 @@ async function oauthPollOnce(loginId) {
 
 // 从 dmg 中解出 WorkDaddy.app 到 UPDATE_DIR（挂载→拷贝→卸载），返回 app 目录
 function extractAppFromDmg(dmgPath) {
-  const mountPoint = '/Volumes/WorkDaddy-update';
+  const mountPoint = '/Volumes/' + WORKDADDY_INSTALL_NAME.replace(/ /g, '-') + '-update';
   const appPackageName = WORKDADDY_INSTALL_NAME + '.app';
   const appDest = path.join(UPDATE_DIR, appPackageName);
   return new Promise((resolve, reject) => {
@@ -1457,7 +1476,7 @@ function applyUpdate() {
     // Windows 更新只负责打开已经过 SHA-256 校验的可见 Setup.exe。
     // 文件替换、WorkBuddy 退出确认和新版启动全部由 Inno Setup 接管；
     // daemon/watchdog 在安装器真正开始复制前保持运行，因此 UI 不会失联。
-    const updatePrefix = PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy-AI-' : 'WorkDaddy-';
+    const updatePrefix = (PROFILE.packageName || (PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy-AI' : 'WorkDaddy')) + '-';
     const packageExt = /\.exe$/i.test(updateState.assetName || '') ? '.exe' : '.zip';
     const srcPackage = path.join(UPDATE_DIR, updatePrefix + updateState.latest + packageExt);
     if (!fs.existsSync(srcPackage)) {
@@ -1470,9 +1489,7 @@ function applyUpdate() {
       markAttemptFailure(error, 'unsupported-artifact');
       return Promise.reject(error);
     }
-    const expectedAsset = PROFILE.id === 'workbuddy-ai'
-      ? `WorkDaddy-AI-Setup-${updateState.latest}.exe`
-      : `WorkDaddy-Setup-${updateState.latest}.exe`;
+    const expectedAsset = updatePrefix + `Setup-${updateState.latest}.exe`;
     if (String(updateState.assetName || '').toLowerCase() !== expectedAsset.toLowerCase()) {
       const error = new Error('安装包名称与目标 profile 或版本不一致');
       markAttemptFailure(error, 'artifact-identity');
@@ -1518,7 +1535,7 @@ function applyUpdate() {
     return Promise.reject(error);
   }
   // 解出新应用：下载阶段只落了 .dmg，这里才把 WorkDaddy.app 从 dmg 解到 UPDATE_DIR（幂等：已解出则复用）
-  const updatePrefix = PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy-AI-' : 'WorkDaddy-';
+  const updatePrefix = (PROFILE.packageName || (PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy-AI' : 'WorkDaddy')) + '-';
   const dmgPath = path.join(UPDATE_DIR, updatePrefix + updateState.latest + '.dmg');
   const cachedArtifact = fs.existsSync(srcApp) ? inspectPackagedApp(srcApp) : null;
   const cachedMatches = Boolean(
@@ -1718,11 +1735,51 @@ function releaseDaemonLock() {
 /* ================= 自动备份（双层触发：CDP 事件 + 文件监听兜底） ================= */
 
 let backupTimer = null;
+let nativeAuthSyncTail = Promise.resolve();
+function syncCodeBuddyAuth() {
+  const work = nativeAuthSyncTail.catch(() => {}).then(async () => {
+    const session = await codeBuddyNative.read();
+    if (!session || !session.account || !session.auth) {
+      if (fs.existsSync(AUTH_FILE)) fs.unlinkSync(AUTH_FILE);
+      return null;
+    }
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(String(session.account.uid || ''))) throw new Error('原生账号标识无效');
+    const content = JSON.stringify(session);
+    fs.mkdirSync(path.dirname(AUTH_FILE), {recursive:true, mode:0o700});
+    let previous = ''; try { previous = fs.readFileSync(AUTH_FILE, 'utf8'); } catch (_) {}
+    if (previous !== content) {
+      const temp = AUTH_FILE + '.tmp';
+      fs.writeFileSync(temp, content, {mode:0o600});
+      fs.renameSync(temp, AUTH_FILE);
+      fs.chmodSync(AUTH_FILE, 0o600);
+    }
+    return session;
+  });
+  nativeAuthSyncTail = work;
+  return work;
+}
+async function switchAccountForProfile(uid) {
+  if (!codeBuddyNative) return switchTo(DATA_DIR, uid, log);
+  await syncCodeBuddyAuth();
+  if (fs.existsSync(AUTH_FILE)) backupCurrent(DATA_DIR, log);
+  const file = accountBackupFile(uid);
+  const session = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (!parseAuthJson(session, {strict:true})) throw new Error('账号备份无效或不属于当前地区');
+  if (String(session.account && session.account.uid) !== String(uid)) throw new Error('账号备份标识不匹配');
+  const result = await codeBuddyNative.replace(session);
+  if (!result || result.uid !== String(uid)) throw new Error('CodeBuddy 未确认账号切换');
+  const current = await syncCodeBuddyAuth();
+  if (!current || String(current.account.uid) !== String(uid)) throw new Error('CodeBuddy 账号复核失败');
+  backupCurrent(DATA_DIR, log);
+  return {uid:String(uid),nickname:wdCompatText(current.account.nickname),nativeSwitched:true};
+}
+
 function scheduleBackup(reason) {
   if (backupTimer) clearTimeout(backupTimer);
-  backupTimer = setTimeout(() => {
+  backupTimer = setTimeout(async () => {
     backupTimer = null;
     try {
+      if (codeBuddyNative) await syncCodeBuddyAuth();
       backupCurrent(DATA_DIR, log);
     } catch (e) {
       log(`[sync] ${reason} 触发备份失败: ${e.message}`);
@@ -1785,6 +1842,9 @@ let suppressPageLoadInjectionForNavigation = 0;
 let cdpPageSessionId = '';
 const automationEventKeys = new Set();
 let pendingAutomationAccountSwitch = null;
+// 自动主题恢复可能与用户刚关闭/开启接管开关并发。递增此序号使旧的
+// Runtime.evaluate 在真正写入页面前失效，避免 WorkDaddy/WorkBuddy 两套主题来回闪烁。
+let themeApplyGeneration = 0;
 
 function settlePendingReloadInjection(pending, mounted) {
   if (!pending || pendingReloadInjection !== pending || pending.settled) return;
@@ -1920,7 +1980,7 @@ function isWorkBuddyCdpTarget(target) {
 async function getPageTarget(port) {
   const r = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1500) });
   const list = await r.json();
-  return (Array.isArray(list) ? list : []).find(isWorkBuddyCdpTarget) || null;
+  return selectPageTarget(list, PROFILE);
 }
 
 async function cleanupForeignInjectedTargets(targets) {
@@ -2131,6 +2191,7 @@ function waitForPageReadyThenDispatch(pageSessionId, attempt = 0) {
 }
 
 function dispatchAutomationEvent(type, detail = {}) {
+  if (PROFILE.capabilities.automations === false) return;
   const eventType = String(type || '').trim();
   if (!['pageReady', 'pageLoaded', 'accountSwitched', 'panelOpened'].includes(eventType)) return;
   const canonicalType = eventType === 'pageReady' ? 'pageReady' : eventType;
@@ -2165,6 +2226,10 @@ function dispatchAutomationEvent(type, detail = {}) {
 
 function onCdpEvent(method, params) {
   switch (method) {
+    case 'Runtime.bindingCalled': {
+      if (PROFILE.kind === 'codebuddy') handleRendererApiBinding(params).catch(() => {});
+      break;
+    }
     case 'Network.requestWillBeSent': {
       const url = (params.request && params.request.url) || '';
       if (/auth|realms|login|token/i.test(url)) scheduleBackup('cdp-auth');
@@ -2247,6 +2312,188 @@ function onCdpEvent(method, params) {
   }
 }
 
+// ===== [CodeBuddy IDE 状态栏] IDE 主窗口浮层管理器 =====
+// 主连接（connectCdp）保持 1.2.9 原行为：只绑定 agentManager.html（完整面板）。
+// IDE 主窗口（workbench.html）由本管理器并行维护：每个 IDE 窗口一条独立 ws，
+// 注入与主连接同一份完整面板脚本（1.2.10 起 IDE 与 Agents 共用面板；inject.js
+// 按 location.href 为 workbench 追加原生账号菜单去重样式）。
+// 主连接单 target 且不重选：若让 workbench 走主连接，先出现的 workbench 会被
+// 绑定，后打开的 agents 窗口将永远等不到注入（实测回归），故必须双路。
+const idePages = new Map(); // Per-target connection, navigation and injection retry state.
+const IDE_INJECT_MAX_ATTEMPTS = 3;
+const IDE_COMMAND_TIMEOUT_MS = 10000;
+
+function ideSend(entry, method, params = {}) {
+  return new Promise((resolve, reject) => {
+    if (!entry.ws || entry.ws.readyState !== 1) return reject(new Error('IDE ws 未连接'));
+    const id = ++entry.msgId;
+    const timer = setTimeout(() => {
+      entry.pending.delete(id);
+      reject(new Error('IDE CDP request timed out'));
+    }, IDE_COMMAND_TIMEOUT_MS);
+    entry.pending.set(id, { resolve, reject, timer });
+    try {
+      entry.ws.send(JSON.stringify({ id, method, params }));
+    } catch (e) {
+      entry.pending.delete(id);
+      clearTimeout(timer);
+      reject(e);
+    }
+  });
+}
+
+function ideInjectPage(entry, reason) {
+  if (entry.injecting) return entry.injecting;
+  if (entry.closed || entry.mounted || entry.attempts >= IDE_INJECT_MAX_ATTEMPTS || Date.now() < entry.retryAt) return Promise.resolve();
+  const navigation = entry.navigation;
+  entry.attempts++;
+  entry.injecting = (async () => {
+    try {
+      const script = buildInjectScript();
+      // 与主连接注入管线一致：先注册 binding（rendererBridgeSource 的 __wbsApiFetch 依赖它）
+      await ideSend(entry, 'Runtime.addBinding', { name: BINDING });
+      if (entry.closed || entry.navigation !== navigation) return;
+      // 脚本顶部 cleanup IIFE 已移除 #wbs-ide-statusbar-root，这里不重复清理
+      const result = await ideSend(entry, 'Runtime.evaluate', { expression: script, returnByValue: false });
+      if (result && result.exceptionDetails) {
+        const ex = result.exceptionDetails.exception;
+        log(`[cdp-ide] IDE 浮层注入抛错(${reason}): ${redactDiagnosticText((ex && (ex.description || ex.value)) || result.exceptionDetails.text || '', 300)}`);
+        return;
+      }
+      // IDE workbench 挂的是完整面板根（.wbs-root）；旧轻量浮层根保留兼容探测
+      let mounted = false;
+      for (let attempt = 0; attempt < 3 && !mounted && !entry.closed && entry.navigation === navigation; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 200 : 600));
+        if (entry.closed || entry.navigation !== navigation) return;
+        // IDE 分支挂完整面板（.wbs-root）；旧轻量浮层根（wbs-ide-statusbar-root）保留兼容
+        const check = await ideSend(entry, 'Runtime.evaluate', {
+          expression: 'JSON.stringify({ fab: !!(document.querySelector(".wbs-root") || document.getElementById("wbs-ide-statusbar-root")), ready: document.readyState })',
+          returnByValue: true,
+        }).catch(() => null);
+        const state = check && check.result && check.result.value ? JSON.parse(check.result.value) : {};
+        mounted = !!state.fab;
+        if (attempt === 2) log(`[cdp-ide] IDE 浮层注入${mounted ? '确认' : '未确认'}(${reason}): ${JSON.stringify(state)}`);
+      }
+      if (entry.closed || entry.navigation !== navigation) return;
+      entry.mounted = mounted;
+      if (mounted) log(`[cdp-ide] IDE 浮层已注入(${reason}) target=${String(entry.url || '').slice(-64)}`);
+    } catch (e) {
+      log(`[cdp-ide] IDE 浮层注入失败(${reason}): ${e.message}`);
+    }
+  })().finally(() => {
+    entry.injecting = null;
+    if (!entry.closed && entry.navigation === navigation && !entry.mounted) {
+      entry.retryAt = Date.now() + 1000 * (2 ** (entry.attempts - 1));
+    }
+  });
+  return entry.injecting;
+}
+
+function ideConnectPage(target) {
+  const entry = { ws: null, url: target.url, msgId: 0, pending: new Map(), reloadTimer: null,
+    injecting: null, mounted: false, attempts: 0, retryAt: 0, navigation: 0, closed: false };
+  idePages.set(target.id, entry);
+  // [CodeBuddy IDE 状态栏] workbench 页面 CSP 禁止直接 fetch http://，api() 走
+  // __wbsApiFetch（Runtime.bindingCalled 通道）。主连接的 bridge 把 send 绑死在
+  // cdpSend 上，因此每个 IDE 页面必须建自己的 bridge 实例，回复才能回到同一页面。
+  entry.bridge = createRendererApiBridge({ token: API_TOKEN, port: () => ACTUAL_PORT, send: (method, params) => ideSend(entry, method, params) });
+  const ws = new WebSocketCtor(target.webSocketDebuggerUrl);
+  entry.ws = ws;
+  ws.onopen = () => {
+    ideSend(entry, 'Page.enable').catch(() => {}); // 监听 loadEventFired 以便刷新后补注入
+    ideInjectPage(entry, 'connect');
+  };
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (_) { return; }
+    if (msg.id !== undefined) {
+      const p = entry.pending.get(msg.id);
+      if (p) {
+        entry.pending.delete(msg.id);
+        clearTimeout(p.timer);
+        msg.error ? p.reject(new Error(msg.error.message)) : p.resolve(msg.result);
+      }
+      return;
+    }
+    // IDE 浮层 FAB 的账号列表/切换请求经 binding 通道进来，用本页 bridge 应答
+    if (msg.method === 'Runtime.bindingCalled') {
+      entry.bridge(msg.params || {}).catch(() => {});
+      return;
+    }
+    // workbench 刷新会重建 DOM，加载完成后补一次注入（脚本幂等）
+    if (msg.method === 'Page.loadEventFired') {
+      entry.navigation++;
+      entry.mounted = false;
+      entry.attempts = 0;
+      entry.retryAt = Date.now() + 400;
+      if (entry.reloadTimer) clearTimeout(entry.reloadTimer);
+      entry.reloadTimer = setTimeout(() => {
+        entry.reloadTimer = null;
+        if (entry.ws && entry.ws.readyState === 1) ideInjectPage(entry, 'reload');
+      }, 400);
+    }
+  };
+  ws.onclose = () => {
+    entry.closed = true;
+    for (const pending of entry.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('IDE CDP connection closed'));
+    }
+    entry.pending.clear();
+    if (entry.reloadTimer) clearTimeout(entry.reloadTimer);
+    if (idePages.get(target.id) === entry) idePages.delete(target.id);
+    log(`[cdp-ide] IDE 页面连接关闭 target=${String(target.url || '').slice(-64)}`);
+  };
+  ws.onerror = () => {};
+}
+
+async function ideSyncScan() {
+  if (PROFILE.kind !== 'codebuddy' || !WebSocketCtor) return;
+  let port = cdp.port;
+  if (!port) port = await findCdpEndpoint();
+  if (!port) return;
+  let list;
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1500) });
+    list = await r.json();
+  } catch (_) {
+    return; // 端口不可达，跳过本轮
+  }
+  const targets = selectIdeTargets(list, PROFILE);
+  for (const target of targets) {
+    if (!target.webSocketDebuggerUrl) continue;
+    const entry = idePages.get(target.id);
+    if (!entry) ideConnectPage(target);
+    else if (entry.ws && entry.ws.readyState === 1) ideInjectPage(entry, 'retry');
+  }
+  // 兜底清理：target 已消失但 ws 尚未触发 close 的陈旧条目
+  const alive = new Set(targets.map((t) => t.id));
+  for (const [id, entry] of idePages) {
+    if (!alive.has(id) && (!entry.ws || entry.ws.readyState !== 1)) idePages.delete(id);
+  }
+}
+
+// [CodeBuddy 会话同步] 手动同步（copy/migrate）后刷新 IDE workbench 窗口。
+// 根因：genie 扩展宿主的会话列表 indexCache（LRU，TTL 5 分钟）不会因外部写入
+// history index.json 而失效（无文件监听），v2 广播对新会话只做 rename/delete——
+// applyUpsert 对缓存外会话直接跳过（"upsert skip, not in this EH"）。侧边栏因此
+// 只能等缓存过期或重启。手动同步是显式用户动作，直接 Page.reload（与账号切换
+// 同级别）。自动复制（切号触发）不刷新：账号切换的 session-change 事件本身
+// 会触发 clearHistoryIndexCache。reload 后 loadEventFired 处理器会自动补注入。
+function reloadIdeWorkbenchWindows(reason) {
+  if (PROFILE.kind !== 'codebuddy') return false;
+  let scheduled = 0;
+  for (const entry of idePages.values()) {
+    if (!entry.ws || entry.ws.readyState !== 1) continue;
+    scheduled++;
+    ideSend(entry, 'Page.reload', { ignoreCache: false })
+      .then(() => log(`[sessions-sync] 已刷新 IDE 窗口(${reason}) target=${String(entry.url || '').slice(-48)}`))
+      .catch((e) => log(`[sessions-sync] IDE 窗口刷新失败(${reason}): ${e.message}`));
+  }
+  if (!scheduled) log(`[sessions-sync] 无已连接的 IDE 窗口可刷新(${reason})`);
+  return scheduled > 0;
+}
+
 async function cdpLoop() {
   for (;;) {
     if (!cdp.connected) {
@@ -2256,6 +2503,8 @@ async function cdpLoop() {
         log(`[cdp] 连接异常: ${e.message}`);
       }
     }
+    // [CodeBuddy IDE 状态栏] IDE 主窗口浮层独立于主连接扫描注入（详见 ideSyncScan）
+    ideSyncScan().catch((e) => log(`[cdp-ide] IDE 扫描异常: ${e.message}`));
     await new Promise((r) => setTimeout(r, CDP_RECONNECT_MS));
   }
 }
@@ -2727,7 +2976,7 @@ function relaunchWorkBuddy() {
         const launcherHome = resolveLauncherHome(command);
         if (launcherHome) childEnv.HOME = launcherHome;
       }
-      const child = spawn(command, environmentMode ? [] : [`--remote-debugging-port=${port}`], {
+      const child = spawn(command, environmentMode ? [] : [`--remote-debugging-port=${port}`, ...(PROFILE.nativeDebugPort ? [`--inspect=127.0.0.1:${PROFILE.nativeDebugPort}`] : [])], {
         detached: true,
         stdio: 'ignore',
         windowsHide: true,
@@ -2761,7 +3010,7 @@ function relaunchWorkBuddy() {
       throw new Error(`未找到 WorkBuddy 可执行文件: ${WORKBUDDY_BINARY}`);
     }
     log(`[logout] 未找到 WorkDaddy.app，直接重新启动 WorkBuddy（带 CDP 端口 ${port}）`);
-    const child = spawn(WORKBUDDY_BINARY, [`--remote-debugging-port=${port}`], {
+    const child = spawn(WORKBUDDY_BINARY, [`--remote-debugging-port=${port}`, ...(PROFILE.nativeDebugPort ? [`--inspect=127.0.0.1:${PROFILE.nativeDebugPort}`] : [])], {
       detached: true,
       stdio: 'ignore',
     });
@@ -3160,6 +3409,11 @@ function isIgnorableAutomationSyncFailure(job) {
   return failed.length > 0 && failed.every(item => item.error === '会话消息文件没有消息，未同步');
 }
 async function assertSessionSyncIdle(sessionIds = []) {
+  if (PROFILE.kind === 'codebuddy') {
+    const sessions=(await codeBuddyNative.sessionItems()).map(item=>JSON.parse(item.value));
+    if(sessions.some(s=>(!sessionIds.length || sessionIds.includes(s.conversationId)) && ['Working','Planning'].includes(s.status))) throw new Error('当前账号有会话仍在运行，请等待完成或停止后再同步');
+    return;
+  }
   if (PROFILE.kind !== 'workbuddy') return;
   if (!cdp.connected) throw new Error('无法确认会话状态，请连接 WorkBuddy 后重试');
   const ids = Array.isArray(sessionIds) ? sessionIds.map((id) => String(id || '').trim()).filter(Boolean) : [];
@@ -3259,7 +3513,9 @@ function automationSwitchAccount(account, options = {}) {
       if (active && active.uid === uid) return { ok: true, uid, switched: false };
       automationSwitchProgress(options, options.restore ? 'restoring-account' : 'switching-account');
       releaseRendererReload = beginRendererReloadPriority();
-      const acct = switchTo(DATA_DIR, uid, log);
+      await preserveAccountSwitchTheme(uid);
+      if (options.isCancelled && options.isCancelled()) throw new Error('任务已停止');
+      const acct = await switchAccountForProfile(uid);
       pendingAutomationAccountSwitch = { account: { uid: acct.uid, nickname: acct.nickname } };
       await reloadWorkBuddyPage();
       if (pendingAutomationAccountSwitch) {
@@ -3725,7 +3981,11 @@ async function performAccountCheckin(uid) {
 }
 
 /** 通过 CDP 把右下角组件注入到 WorkBuddy 渲染进程（幂等，可反复调用） */
-function injectWidget(reason, executionContextId) {
+async function injectWidget(reason, executionContextId) {
+  // CodeBuddy replaces its bootstrap body while loading agentManager. Mounting
+  // at executionContextCreated leaves a live widget guard without any DOM.
+  // The existing page-load path owns injection for this client.
+  if (PROFILE.kind === 'codebuddy' && reason === 'reload-context') return {mounted:false};
   if (!cdp.connected) {
     return Promise.reject(new Error('CDP 未连接，无法注入组件'));
   }
@@ -3759,6 +4019,7 @@ function injectWidget(reason, executionContextId) {
   lastInjectTs = now;
   let script;
   try {
+    if (PROFILE.kind === 'codebuddy') await cdpSend('Runtime.addBinding', {name: BINDING});
     script = buildInjectScript();
   } catch (e) {
     return Promise.reject(new Error('读取注入脚本失败: ' + e.message));
@@ -3835,6 +4096,7 @@ function injectWidget(reason, executionContextId) {
 }
 
 function buildInjectScript() {
+  const markdownScript = fs.readFileSync(path.join(__dirname, 'markdown-preview.js'), 'utf8');
   const toastScript = fs.readFileSync(path.join(__dirname, 'toast-runtime.js'), 'utf8');
   const compatScript = fs.readFileSync(path.join(__dirname, 'workbuddy-compat.js'), 'utf8');
   let injectScript = fs.readFileSync(path.join(__dirname, 'inject.js'), 'utf8');
@@ -3857,14 +4119,36 @@ function buildInjectScript() {
     injectScript = injectScript.replace(anchor, pickerCode + '\n' + anchor);
   }
   // 组件内通过 fetch 调用本机 API，注入时写入实际端口
-  return (toastScript + '\n' + compatScript + '\n' + injectScript)
+  // Only WorkDaddy's source uses this private HTML sink. Never replace the
+  // host's innerHTML setter: official DOM keeps its Trusted Types enforcement.
+  const trustedTypesBootstrap = PROFILE.kind === 'codebuddy' ? `(function(){
+    var d=Object.getOwnPropertyDescriptor(Element.prototype,'innerHTML');
+    var p=window.__wbsTrustedHtmlPolicy;
+    if(!p && typeof trustedTypes!=='undefined') {
+      p=trustedTypes.createPolicy('notebookChatEditController',{createHTML:function(v){return String(v);}});
+      window.__wbsTrustedHtmlPolicy=p;
+    }
+    function html(v){return p?p.createHTML(v):v;}
+    Object.defineProperty(Element.prototype,'__wbsHTML',{configurable:true,get:d.get,
+      set:function(v){return d.set.call(this,html(v));}});
+    var outer=Object.getOwnPropertyDescriptor(Element.prototype,'outerHTML');
+    Object.defineProperty(Element.prototype,'__wbsOuterHTML',{configurable:true,get:outer.get,
+      set:function(v){return outer.set.call(this,html(v));}});
+    var adjacent=Element.prototype.insertAdjacentHTML;
+    Object.defineProperty(Element.prototype,'__wbsInsertAdjacentHTML',{configurable:true,
+      value:function(position,v){return adjacent.call(this,position,html(v));}});
+  })();\n` : '';
+  let source = (PROFILE.kind === 'codebuddy' ? rendererBridgeSource() : '') + toastScript + '\n' + compatScript + '\n' + injectScript;
+  if (PROFILE.kind === 'codebuddy') source = source.replace(/\.innerHTML\b/g, '.__wbsHTML').replace(/\binnerHTML\s*:/g, '__wbsHTML:').replace(/\.outerHTML\b/g, '.__wbsOuterHTML').replace(/\.insertAdjacentHTML\b/g, '.__wbsInsertAdjacentHTML');
+  // Keep the sanitizer outside the legacy innerHTML sink rewrite.
+  return (trustedTypesBootstrap + markdownScript + '\n' + source)
     .replace(/__WBS_API__/g, `http://${HOST}:${ACTUAL_PORT}`)
     .replace(/__WBS_VERSION__/g, DAEMON_VERSION)
     // 注入本地 API 能力凭证；旧版面板不会携带该 header，但新版 daemon 会在启动时重新注入新版面板。
     .replace(/__WBS_API_TOKEN__/g, API_TOKEN)
     .replace(/__WBS_DIAGNOSTICS_ENABLED__/g, diagnosticsEnabled() ? 'true' : 'false')
     .replace(/__WBS_PROFILE__/g, PROFILE.id)
-    .replace(/__WBS_CAPS__/g, JSON.stringify(PROFILE.capabilities))
+    .replace(/__WBS_CAPS__/g, () => JSON.stringify({...PROFILE.capabilities, appName: PROFILE.appName}))
     .replace(/__WBS_AVATAR_LOGO__/g, 'data:image/svg+xml;base64,' + fs.readFileSync(path.join(__dirname, 'assets', 'workdaddy-app-icon-source.svg')).toString('base64'))
     .replace(/__WBS_LOGO__/g, 'data:image/svg+xml;base64,' + fs.readFileSync(path.join(__dirname, 'assets', 'workdaddy-logo.svg')).toString('base64'))
     .replace(/__WBS_BUDDY_MARK__/g, 'data:image/svg+xml;base64,' + fs.readFileSync(path.join(__dirname, 'assets', 'workbuddy-buddy-mark.svg')).toString('base64'))
@@ -3946,70 +4230,29 @@ async function writeDiagnosticsSnapshot(reason) {
 // ===== SESSIONS_API_MARK：会话管理（读 WorkBuddy workbuddy.db）=====
 const SESSIONS_DB = PROFILE.sessionDb;
 const SESSION_DB = createSessionDb({ dbPath: SESSIONS_DB });
+const CODEBUDDY_SESSIONS = PROFILE.kind === 'codebuddy' ? createCodeBuddySessionStore({
+  readItems: async () => {
+    const items=await codeBuddyNative.sessionItems();
+    for(const item of items) {const r=JSON.parse(item.value);if(r.userId && r.cwd)codeBuddyFiles.register({id:r.conversationId,user_id:r.userId,cwd:r.cwd});}
+    return items;
+  },
+  writeChanges: async changes => {
+    await assertSessionSyncIdle(changes.map(change=>change.id));
+    return codeBuddyFiles.commit(changes, () => codeBuddyNative.writeSessions(changes));
+  },
+}) : null;
 
 function sqliteRun(sql, params = []) {
-  if (PROFILE.kind === 'codebuddy') {
-    return Promise.reject(new Error(`${PROFILE.name} 会话库暂只支持读取`));
-  }
-  return SESSION_DB.run(sql, params);
-}
-function codeBuddySessionRows() {
-  return SESSION_DB.all("SELECT key, value FROM ItemTable WHERE key LIKE 'session:%'")
-    .then((items) => items.map((item) => {
-        let value = {};
-        try { value = typeof item.value === 'string' ? JSON.parse(item.value) : (item.value || {}); } catch (_) {}
-        const id = String(value.conversationId || String(item.key || '').replace(/^session:/, ''));
-        return {
-          id, cwd: value.cwd || '', user_id: value.userId || '', title: value.title || '', custom_title: value.title || '',
-          status: value.status || '', created_at: value.createdAt || null, updated_at: value.updatedAt || null,
-          last_activity_at: value.updatedAt || null, is_playground: value.isPlayground ? 1 : 0,
-          deleted_at: null, source_mode: value.mode || 'agents', mode: value.mode || 'agents', model: value.model || '',
-        };
-      }))
-    .catch((e) => { throw new Error('CodeBuddy 会话库读取失败: ' + e.message); });
+  return (CODEBUDDY_SESSIONS || SESSION_DB).run(sql, params);
 }
 function sqlParamAt(textSql, params, questionIndex) {
   return params[parameterCount(textSql.slice(0, questionIndex + 1)) - 1];
 }
 async function sqliteQuery(sql, params = []) {
   const expectedParams = parameterCount(sql);
-  if (expectedParams !== params.length) {
-    throw new Error(`sqlite 参数数量不匹配: SQL 需要 ${expectedParams} 个，实际收到 ${params.length} 个`);
-  }
-  if (PROFILE.kind === 'codebuddy') {
-    const rows = await codeBuddySessionRows();
-    const textSql = String(sql || '');
-    const uidMatch = /user_id\s*=\s*\?/i.exec(textSql);
-    const idMatch = /id\s+IN\s*\(([^)]*)\)/i.exec(textSql);
-    const singleIdMatch = /\bid\s*=\s*\?/i.exec(textSql);
-    let filtered = rows;
-    if (uidMatch) {
-      const questionIndex = textSql.indexOf('?', uidMatch.index);
-      const uid = sqlParamAt(textSql, params, questionIndex);
-      filtered = filtered.filter((r) => String(r.user_id) === String(uid));
-    }
-    if (idMatch) {
-      const questionIndex = textSql.indexOf('?', idMatch.index);
-      const start = parameterCount(textSql.slice(0, questionIndex + 1)) - 1;
-      const ids = new Set(params.slice(start, start + parameterCount(idMatch[1])).map(String));
-      filtered = filtered.filter((r) => ids.has(String(r.id)));
-    }
-    if (singleIdMatch) {
-      const questionIndex = textSql.indexOf('?', singleIdMatch.index);
-      const id = sqlParamAt(textSql, params, questionIndex);
-      filtered = filtered.filter((r) => String(r.id) === String(id));
-    }
-    if (/SELECT\s+DISTINCT\s+cwd/i.test(textSql)) return Array.from(new Set(filtered.map((r) => r.cwd).filter(Boolean))).map((cwd) => ({ cwd }));
-    if (/SELECT\s+user_id/i.test(textSql) && /LIMIT\s+1/i.test(textSql)) return filtered.slice(0, 1).map((r) => ({ user_id: r.user_id }));
-    return filtered;
-  }
-  const rows = await SESSION_DB.all(sql, params);
-  // Keep the existing API contract (SQLite cells were strings, NULL was empty)
-  // while avoiding the delimiter/newline corruption of the former text parser.
-  return rows.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [
-    key,
-    value === null || value === undefined ? '' : String(value).trim(),
-  ])));
+  if (expectedParams !== params.length) throw new Error(`sqlite 参数数量不匹配: SQL 需要 ${expectedParams} 个，实际收到 ${params.length} 个`);
+  const rows = await (CODEBUDDY_SESSIONS || SESSION_DB).all(sql, params);
+  return rows.map(row => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, value == null ? '' : String(value).trim()])));
 }
 
 // WorkBuddy 将会话正文保存在 ~/.workbuddy*/projects 等系统目录，同时在 sessions.cwd
@@ -4246,6 +4489,7 @@ function archiveRelativePath(wbHome, target) {
 }
 
 function collectSessionArchiveFiles(wbHome, sessionId) {
+  if (codeBuddyFiles) return codeBuddyFiles.collect(sessionId);
   if (!isValidSessionId(sessionId)) throw new Error('无效的会话 ID');
   const files = [];
   const collect = (target) => {
@@ -4312,6 +4556,7 @@ function ensureArchiveParentNoFollow(wbHome, target) {
 }
 
 function restoreSessionArchiveFiles(wbHome, sessionArchive, newId) {
+  if (codeBuddyFiles) return codeBuddyFiles.restore(sessionArchive,newId,false);
   const oldId = String(sessionArchive && sessionArchive.record && sessionArchive.record.id || '');
   if (!isValidSessionId(oldId) || !isValidSessionId(newId)) throw new Error('会话归档包含无效 ID');
   const sourceFiles = Array.isArray(sessionArchive.files) ? sessionArchive.files : [];
@@ -4335,6 +4580,7 @@ function restoreSessionArchiveFiles(wbHome, sessionArchive, newId) {
 // Only readSessionTransfer creates these private staging paths. Never accept them
 // from a JSON API payload or an unverified archive entry.
 async function restoreStagedSessionArchiveFiles(wbHome, archive, newId) {
+  if (codeBuddyFiles) return codeBuddyFiles.restore(archive,newId,true);
   const oldId = String(archive.record.id);
   const targets = new Set();
   for (const entry of archive.files) {
@@ -4366,6 +4612,11 @@ function sqlPlaceholders(values) {
 }
 
 async function insertCopiedSession(src, targetUid, newId) {
+  let rollbackNativeIndex = null;
+  if (codeBuddyFiles) {
+    codeBuddyFiles.register({...src,id:newId,user_id:targetUid});
+    rollbackNativeIndex = await codeBuddyFiles.publish(newId,src.id);
+  }
   const updatedAt = Date.now();
   const lastActivityAt = Number(src.last_activity_at || src.updated_at || updatedAt);
   const vals = [
@@ -4391,10 +4642,15 @@ async function insertCopiedSession(src, targetUid, newId) {
     src.use_sandbox_cli === null || src.use_sandbox_cli === undefined || src.use_sandbox_cli === '' ? null : Number(src.use_sandbox_cli),
     src.project_id || null,
   ];
+  try {
   await sqliteRun(
     'INSERT INTO sessions (' + SESSION_COPY_COLUMNS.join(',') + ') VALUES (' + sqlPlaceholders(vals) + ');',
     vals
   );
+  } catch(error) {
+    if(rollbackNativeIndex) await rollbackNativeIndex();
+    throw error;
+  }
   // The inserted row intentionally gets a fresh updated_at. Persisting the
   // source revision here would make every later switch look dirty.
   return Object.assign({}, src, {
@@ -4435,10 +4691,9 @@ async function createForkSession(src, selection) {
   return { id, sourceId: src.id, keptMessages: plan.keep, droppedMessages: plan.drop };
 }
 
-async function exportSessions(ids, password) {
+async function prepareSessionExport(ids) {
   const selectedIds = normalizeSessionIdBatch(ids);
   if (!selectedIds.length) throw new Error('未选择会话');
-  requiredPassword(password);
   const rows = await sqliteQuery(
     'SELECT ' + SESSION_COPY_COLUMNS.join(',') + ' FROM sessions WHERE id IN (' + sqlPlaceholders(selectedIds) + ') AND deleted_at IS NULL;',
     selectedIds
@@ -4450,6 +4705,12 @@ async function exportSessions(ids, password) {
     return { record, files: collectSessionArchiveFiles(wbHome, id) };
   });
   if (!sessions.length) throw new Error('没有可导出的会话');
+  return sessions;
+}
+
+async function exportSessions(ids, password) {
+  requiredPassword(password);
+  const sessions = await prepareSessionExport(ids);
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'workdaddy-session-export-'));
   const file = path.join(directory, 'sessions.wds');
   try {
@@ -4488,8 +4749,9 @@ async function importSessionArchives(payload, targetUid, staged = false) {
     catch (error) { errors.push(error.message); continue; }
     const newId = crypto.randomUUID();
     try {
+      if (codeBuddyFiles) codeBuddyFiles.register({...record,id:newId,user_id:ownerUid});
       if (staged) await restoreStagedSessionArchiveFiles(PROFILE.dataRoot, archive, newId);
-      else restoreSessionArchiveFiles(PROFILE.dataRoot, archive, newId);
+      else await restoreSessionArchiveFiles(PROFILE.dataRoot, archive, newId);
       await insertCopiedSession(record, ownerUid, newId);
       imported.push({ sourceId: oldId, id: newId, uid: ownerUid });
     } catch (error) {
@@ -4563,6 +4825,110 @@ function sessionCopyContentRevision(row) {
     Number(row && row.updated_at || 0), Number(row && row.last_activity_at || 0),
     String(row && row.status || ''), String(row && row.title || ''), String(row && row.custom_title || ''),
   ]);
+}
+
+// WorkBuddy stores the context-window denominator on the session row and the
+// usage ring data in session_usage. Both are optional across client versions;
+// a missing column/table must not break account switching for older clients.
+let sessionContextWindowState = typeof PROFILE !== 'undefined' && PROFILE.kind === 'workbuddy' ? 'unknown' : 'unsupported';
+let sessionUsageState = typeof PROFILE !== 'undefined' && PROFILE.kind === 'workbuddy' ? 'unknown' : 'unsupported';
+
+function isMissingSessionStorageError(error) {
+  return /no such (table|column)/i.test(String(error && error.message || error || ''));
+}
+
+async function readSessionContextWindow(id) {
+  if (sessionContextWindowState === 'unsupported') return null;
+  try {
+    const rows = await sqliteQuery('SELECT context_window FROM sessions WHERE id = ? LIMIT 1;', [id]);
+    sessionContextWindowState = 'supported';
+    const value = rows && rows[0] && rows[0].context_window;
+    if (value === '' || value === null || value === undefined) return null;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) && numeric >= 0 ? numeric : null;
+  } catch (error) {
+    if (isMissingSessionStorageError(error)) {
+      sessionContextWindowState = 'unsupported';
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function writeSessionContextWindow(id, value) {
+  if (sessionContextWindowState === 'unsupported' || value === null || value === undefined) return;
+  try {
+    await sqliteRun(
+      'UPDATE sessions SET context_window = ? WHERE id = ? AND deleted_at IS NULL;',
+      [value, id]
+    );
+    sessionContextWindowState = 'supported';
+  } catch (error) {
+    if (isMissingSessionStorageError(error)) {
+      sessionContextWindowState = 'unsupported';
+      return;
+    }
+    throw error;
+  }
+}
+
+async function copySessionUsage(sourceId, targetId) {
+  if (sessionUsageState === 'unsupported') return;
+  let sourceRows;
+  try {
+    sourceRows = await sqliteQuery(
+      'SELECT used, size, updated_at, credit_json FROM session_usage WHERE session_id = ? LIMIT 1;',
+      [sourceId]
+    );
+    sessionUsageState = 'supported';
+  } catch (error) {
+    if (isMissingSessionStorageError(error)) {
+      sessionUsageState = 'unsupported';
+      return;
+    }
+    throw error;
+  }
+  if (!sourceRows || !sourceRows.length) return;
+  const source = sourceRows[0];
+  const used = source.used === '' ? null : Number(source.used);
+  const size = source.size === '' ? null : Number(source.size);
+  if (![used, size].every(value => value === null || Number.isFinite(value))) return;
+  let targetRows;
+  try {
+    targetRows = await sqliteQuery(
+      'SELECT used, size, updated_at, credit_json FROM session_usage WHERE session_id = ? LIMIT 1;',
+      [targetId]
+    );
+  } catch (error) {
+    if (isMissingSessionStorageError(error)) {
+      sessionUsageState = 'unsupported';
+      return;
+    }
+    throw error;
+  }
+  const target = targetRows && targetRows[0];
+  if (target && String(target.used || '') === String(source.used || '') &&
+      String(target.size || '') === String(source.size || '') &&
+      String(target.updated_at || '') === String(source.updated_at || '') &&
+      String(target.credit_json || '') === String(source.credit_json || '')) return;
+  try {
+    await sqliteRun(
+      'INSERT OR REPLACE INTO session_usage (session_id, used, size, updated_at, credit_json) VALUES (?, ?, ?, ?, ?);',
+      [
+        targetId,
+        used,
+        size,
+        source.updated_at === '' ? null : Number(source.updated_at),
+        source.credit_json === '' ? null : String(source.credit_json),
+      ]
+    );
+  } catch (error) {
+    if (isMissingSessionStorageError(error)) {
+      sessionUsageState = 'unsupported';
+      return;
+    }
+    throw error;
+  }
 }
 
 // This revision is the cheap fallback used when the renderer event was
@@ -4749,6 +5115,7 @@ async function copySessionRecord(src, targetUid, options = {}) {
     ))[0];
     const sourceRow = await readRow(src.id, sourceUid);
     if (!sourceRow) throw new Error('源会话已变化，请重试');
+    const sourceContextWindow = await readSessionContextWindow(sourceRow.id);
     const dirtyIndex = typeof getSessionDirtyIndex === 'function' ? getSessionDirtyIndex() : null;
     const dirtyMarker = options.auto && dirtyIndex ? dirtyIndex.get(sourceUid, sourceRow.id) : null;
     const clearAutoDirty = () => {
@@ -4780,16 +5147,14 @@ async function copySessionRecord(src, targetUid, options = {}) {
       } catch (_) {}
     }
     const targetIds = candidates.length ? candidates.map(row => row.id) : [crypto.randomUUID()];
+    // Native history paths require ownership even before a destination row exists.
+    if (codeBuddyFiles) {
+      codeBuddyFiles.register(sourceRow);
+      for (const id of targetIds) codeBuddyFiles.register(candidates.find(row => row.id === id) || {...sourceRow,id,user_id:targetUid});
+    }
     const aliases = getAutoCopySessionMemberRecords(DATA_DIR, lineageId).map(member => member.id).concat(targetIds);
     const syncCache = getSessionSyncCache();
     const existingMappingTarget = mapping && mapping.targetId ? candidates.find(row => row.id === mapping.targetId) : null;
-    // A brand-new destination has no target bytes to protect and is the only
-    // path that copies every selected session. The synchronous snapshot/apply
-    // implementation matches main's low-overhead file path; using it here
-    // avoids the per-file async stream/hash scheduling cost during first-time
-    // account initialization. Existing copies keep the async path so normal
-    // incremental repairs continue to yield to the renderer.
-    const firstTargetCopy = options.auto && !existingMappingTarget && candidates.length === 0;
     // Automatic switching revisits the same source/target pairs frequently.
     // WorkBuddy updates the session row whenever its content changes. Validate
     // the persisted source/target row revisions before paying for a complete
@@ -4799,7 +5164,7 @@ async function copySessionRecord(src, targetUid, options = {}) {
     // Fast path is opt-in by fingerprintVersion so mappings written before
     // revision persistence are revalidated once through the normal snapshot
     // comparison path.
-    if (options.auto && existingMappingTarget && mapping.fingerprintVersion === 2 &&
+    if (options.auto && existingMappingTarget && mapping.fingerprintVersion === 3 &&
         mappingSourceRevisionMatches(mapping, sourceUid, sourceRow) &&
         mappingTargetRevisionMatches(mapping, existingMappingTarget)) {
       const sourceBytes = Number(mapping.sourceBytes);
@@ -4815,21 +5180,41 @@ async function copySessionRecord(src, targetUid, options = {}) {
         copiedBytes: 0,
       };
     }
-    let left = firstTargetCopy
-      ? sessionSync.readSnapshot(PROFILE.dataRoot, sourceRow.id, aliases, syncCache)
-      : await sessionSync.readSnapshotAsync(PROFILE.dataRoot, sourceRow.id, aliases, syncCache);
+    // Version 3 proves transcript runtime IDs were rebound, not merely that
+    // two accounts have equal messages. Revalidate legacy mappings once.
+    let runtimeRepairBytes = 0;
+    const readAndRepairSnapshot = async id => {
+      let snapshot = await sessionSync.readSnapshotAsync(PROFILE.dataRoot, id, aliases, syncCache);
+      if (PROFILE.kind !== 'workbuddy') return snapshot;
+      const row = id === sourceRow.id ? sourceRow : candidates.find(candidate => candidate.id === id);
+      const guard = async () => {
+        await assertSessionSyncIdle([id]);
+        if (row && JSON.stringify(await readRow(id, row.user_id)) !== JSON.stringify(row)) {
+          throw new Error('会话记录正在变化，请稍后重试');
+        }
+      };
+      const repaired = await sessionSync.repairRuntimeIdentity(snapshot, {
+        backupRoot: path.join(DATA_DIR, 'session-sync-backups'), guard,
+        commit: async verify => { await guard(); await verify(); },
+      });
+      runtimeRepairBytes += repaired.copiedBytes;
+      if (repaired.copied) snapshot = await sessionSync.readSnapshotAsync(PROFILE.dataRoot, id, aliases, syncCache);
+      return snapshot;
+    };
+    let left = await readAndRepairSnapshot(sourceRow.id);
     const selection = await sessionSync.selectTargetSnapshot(left, targetIds, async id => {
       await yieldAutoCopyToRenderer();
-      return firstTargetCopy
-        ? sessionSync.readSnapshot(PROFILE.dataRoot, id, aliases, syncCache)
-        : sessionSync.readSnapshotAsync(PROFILE.dataRoot, id, aliases, syncCache);
+      return readAndRepairSnapshot(id);
     }, mapping && mapping.targetId);
     // A divergent source still needs to reach the destination. Publish it as
     // a new physical session in the same lineage, so later scans find it by
     // content and do not create another copy on every switch.
     const branched = selection.comparison.kind === 'conflict';
     const targetId = branched ? crypto.randomUUID() : selection.targetId;
-    if (branched) aliases.push(targetId);
+    if (branched) {
+      aliases.push(targetId);
+      if (codeBuddyFiles) codeBuddyFiles.register({...sourceRow,id:targetId,user_id:targetUid});
+    }
     const existing = candidates.find(row => row.id === targetId) || null;
     // An equal selection needs no writes: the trimmed selection snapshot is
     // enough to skip, and the next sync re-reads everything anyway. Avoid the
@@ -4838,7 +5223,7 @@ async function copySessionRecord(src, targetUid, options = {}) {
       await withAutoCopyMetaWrite(() => {
         if (!getAutoCopySessionMembers(DATA_DIR, lineageId, targetUid).includes(targetId)) addAutoCopySessionMember(DATA_DIR, lineageId, targetUid, targetId);
         setAutoCopyMapping(DATA_DIR, lineageId, targetUid, {
-          targetId, status: 'copied', failedFiles: 0, fingerprintVersion: 2,
+          targetId, status: 'copied', failedFiles: 0, fingerprintVersion: 3,
           ...mappingWithSourceRevision(mapping, sourceUid, sourceRow),
           targetRevision: sessionCopyRowRevision(existing || { ...sourceRow, id: targetId, user_id: targetUid }),
           targetStateRevision: sessionCopyStableStateRevision(existing || { ...sourceRow, id: targetId, user_id: targetUid }),
@@ -4847,11 +5232,9 @@ async function copySessionRecord(src, targetUid, options = {}) {
       });
       const warning = left.totalBytes > 100 * 1024 * 1024 ? '会话超过 100 MB，同步可能较慢' : '';
       clearAutoDirty();
-      return { status: 'skipped', sourceId: src.id, targetId, branched: false, failedFiles: 0, warning, sourceBytes: left.totalBytes, totalBytes: left.totalBytes, copiedBytes: 0 };
+      return { status: runtimeRepairBytes ? 'copied' : 'skipped', sourceId: src.id, targetId, branched: false, failedFiles: 0, warning, sourceBytes: left.totalBytes, totalBytes: left.totalBytes, copiedBytes: runtimeRepairBytes };
     }
-    let right = firstTargetCopy
-      ? sessionSync.readSnapshot(PROFILE.dataRoot, targetId, aliases, syncCache)
-      : await sessionSync.readSnapshotAsync(PROFILE.dataRoot, targetId, aliases, syncCache);
+    let right = await sessionSync.readSnapshotAsync(PROFILE.dataRoot, targetId, aliases, syncCache);
     // Size is advisory only; both manual and automatic sync keep all files.
     const warning = Math.max(left.totalBytes, right.totalBytes) > 100 * 1024 * 1024
       ? '会话超过 100 MB，同步可能较慢' : '';
@@ -4862,9 +5245,9 @@ async function copySessionRecord(src, targetUid, options = {}) {
     }
     const comparison = sessionSync.compareSnapshots(left, right);
     if (comparison.kind === 'conflict') throw new Error('会话记录正在变化，请稍后重试');
-    let changed = false;
+    let changed = runtimeRepairBytes > 0;
     let totalBytes = left.totalBytes;
-    let copiedBytes = 0;
+    let copiedBytes = runtimeRepairBytes;
     let persistedTargetRow = existing || null;
     const update = async (from, to, fromRow, toRow, missingOnly = false) => {
       await yieldAutoCopyToRenderer();
@@ -4884,6 +5267,8 @@ async function copySessionRecord(src, targetUid, options = {}) {
           // after insertion cannot create an untracked duplicate on retry.
           await withAutoCopyMetaWrite(() => addAutoCopySessionMember(DATA_DIR, lineageId, targetUid, targetId, { branchCopy: branched }));
           persistedTargetRow = await insertCopiedSession(fromRow, targetUid, targetId);
+          await writeSessionContextWindow(targetId, sourceContextWindow);
+          await copySessionUsage(fromRow.id, targetId);
         }
         else if (!missingOnly) {
           const updatedAt = Number(fromRow.updated_at || 0);
@@ -4893,25 +5278,20 @@ async function copySessionRecord(src, targetUid, options = {}) {
             [fromRow.title || '', fromRow.custom_title || '', fromRow.status || 'Pending',
               updatedAt, lastActivityAt, toRow.id, toRow.user_id]
           );
+          await writeSessionContextWindow(toRow.id, sourceContextWindow);
+          await copySessionUsage(fromRow.id, toRow.id);
           persistedTargetRow = Object.assign({}, toRow, {
             title: fromRow.title || '', custom_title: fromRow.custom_title || '', status: fromRow.status || 'Pending',
             updated_at: updatedAt, last_activity_at: lastActivityAt,
           });
         }
       };
-      const applied = await (firstTargetCopy
-        ? sessionSync.applySnapshot(from, to, {
-          backupRoot: path.join(DATA_DIR, 'session-sync-backups'), metadata: toRow,
-          missingOnly, guard: verifyRows,
-          onProgress: options.onProgress,
-          commit,
-        })
-        : sessionSync.applySnapshotAsync(from, to, {
+      const applied = await sessionSync.applySnapshotAsync(from, to, {
         backupRoot: path.join(DATA_DIR, 'session-sync-backups'), metadata: toRow,
         missingOnly, guard: verifyRows,
         onProgress: options.onProgress,
         commit,
-      }));
+      });
       totalBytes = applied.totalBytes;
       copiedBytes += applied.copiedBytes;
       changed = true;
@@ -4922,12 +5302,8 @@ async function copySessionRecord(src, targetUid, options = {}) {
       if (comparison.missingRight) await update(left, right, sourceRow, existing, true);
       if (comparison.missingLeft) {
         // Re-read after the first repair, so race detection uses current bytes.
-        left = firstTargetCopy
-          ? sessionSync.readSnapshot(PROFILE.dataRoot, sourceRow.id, aliases, syncCache)
-          : await sessionSync.readSnapshotAsync(PROFILE.dataRoot, sourceRow.id, aliases, syncCache);
-        right = firstTargetCopy
-          ? sessionSync.readSnapshot(PROFILE.dataRoot, targetId, aliases, syncCache)
-          : await sessionSync.readSnapshotAsync(PROFILE.dataRoot, targetId, aliases, syncCache);
+        left = await sessionSync.readSnapshotAsync(PROFILE.dataRoot, sourceRow.id, aliases, syncCache);
+        right = await sessionSync.readSnapshotAsync(PROFILE.dataRoot, targetId, aliases, syncCache);
         await update(right, left, existing, sourceRow, true);
       }
     }
@@ -4935,7 +5311,7 @@ async function copySessionRecord(src, targetUid, options = {}) {
     await withAutoCopyMetaWrite(() => {
       if (!getAutoCopySessionMembers(DATA_DIR, lineageId, targetUid).includes(targetId)) addAutoCopySessionMember(DATA_DIR, lineageId, targetUid, targetId);
       return setAutoCopyMapping(DATA_DIR, lineageId, targetUid, {
-        targetId, status: 'copied', failedFiles: 0, fingerprintVersion: 2,
+        targetId, status: 'copied', failedFiles: 0, fingerprintVersion: 3,
         ...mappingWithSourceRevision(mapping, sourceUid, sourceRow),
         targetRevision: sessionCopyRowRevision(mappingTarget),
         targetStateRevision: sessionCopyStableStateRevision(mappingTarget),
@@ -4989,7 +5365,7 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
     ? getSessionDirtyIndex()
     : { shouldSync: () => true };
   const clearStableDirtyMarker = (row, mapping, provenEqual = false) => {
-    if (!mapping || mapping.fingerprintVersion !== 2 || !mapping.targetId ||
+    if (!mapping || mapping.fingerprintVersion !== 3 || !mapping.targetId ||
         (!provenEqual && !mappingSourceRevisionMatches(mapping, source, row))) return false;
     if (typeof dirtyIndex.get !== 'function' || typeof clearSessionDirty !== 'function') return false;
     const marker = dirtyIndex.get(source, row.id);
@@ -5058,7 +5434,7 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
       if (!initializedClean(row)) return false;
       const lineageId = rules.allLineages && rules.allLineages[String(row.id)];
       const mapping = lineageId ? mappings.get(String(lineageId)) : null;
-      return mapping && mapping.fingerprintVersion === 2 && mapping.targetId &&
+      return mapping && mapping.fingerprintVersion === 3 && mapping.targetId &&
         !mappingSourceRevisionMatches(mapping, source, row);
     });
     if (hasRevisionDrift) await loadTargetRows();
@@ -5090,7 +5466,7 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
       // The target mapping is enough to restore the active view. Only enter
       // the worker when it is missing, its row disappeared, or the renderer
       // explicitly marked the source session dirty.
-      if (!mapping || mapping.fingerprintVersion !== 2 || !mapping.targetId ||
+      if (!mapping || mapping.fingerprintVersion !== 3 || !mapping.targetId ||
           !targetById || !targetById.has(String(mapping.targetId))) {
         dirtyRows.push(row);
         continue;
@@ -5118,6 +5494,7 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
     }
     const lineageId = rules.allLineages && rules.allLineages[String(row.id)];
     const mapping = lineageId ? mappings.get(String(lineageId)) : null;
+    if (mapping && mapping.fingerprintVersion !== 3) { dirtyRows.push(row); continue; }
     if (dirtyIndex.shouldSync(source, row.id)) {
       if (clearStableDirtyMarker(row, mapping)) continue;
       if (mappingSourceLifecycleRevisionMatches(mapping, row) && targetById && stableTargetExists(mapping)) {
@@ -5127,7 +5504,7 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
       dirtyRows.push(row);
       continue;
     }
-    if (!mapping || mapping.fingerprintVersion !== 2 || !mapping.targetId) { dirtyRows.push(row); continue; }
+    if (!mapping || mapping.fingerprintVersion !== 3 || !mapping.targetId) { dirtyRows.push(row); continue; }
     if (mappingSourceRevisionMatches(mapping, source, row)) continue;
     // Once the renderer has supplied a baseline, a persisted revision drift
     // without a dirty event is historical lineage churn, not a content edit.
@@ -5164,7 +5541,7 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
   // unchanged sessions do not need to enter the worker pool at all.
   return lineageRows.filter((row) => {
     const mapping = row.lineageId ? mappings.get(String(row.lineageId)) : null;
-    if (!mapping || mapping.fingerprintVersion !== 2 || !mapping.targetId) return true;
+    if (!mapping || mapping.fingerprintVersion !== 3 || !mapping.targetId) return true;
     const targetRow = targetById.get(String(mapping.targetId));
     return !targetRow || !mappingSourceRevisionMatches(mapping, source, row) ||
       (!mappingTargetRevisionMatches(mapping, targetRow) &&
@@ -5444,6 +5821,7 @@ function startAutoCopyJob(sourceUid, targetUid, plan, labels) {
       }
     };
     await Promise.all(Array.from({ length: concurrency }, () => processNext()));
+    await refreshCopiedSessionList(job);
     job.details = job.details.filter(Boolean);
     job.status = job.conflicts ? 'conflict' : (job.failed || job.partial ? 'partial' : 'done');
     job.finishedAt = Date.now();
@@ -5459,6 +5837,50 @@ function startAutoCopyJob(sourceUid, targetUid, plan, labels) {
   autoCopyQueue.push({ job, run, complete });
   runAutoCopyQueue();
   return job;
+}
+
+async function refreshWorkBuddySessionList(targetUid, reason = 'sessions') {
+  // WorkBuddy writes session SQLite directly, bypassing its list-change bus.
+  // Its first snapshot can therefore predate a migration, account switch, or
+  // copy batch. Use the official collection refresh (including grouped
+  // folders), never navigation or a second renderer reload. CodeBuddy already
+  // publishes native upserts; it has a different store and must not enter this
+  // SDK path.
+  if (PROFILE.kind !== 'workbuddy') return false;
+  if (!cdp.connected || String((currentAccount() || {}).uid || '') !== String(targetUid || '')) return false;
+  let timer;
+  try {
+    const response = await Promise.race([
+      cdpSend('Runtime.evaluate', {
+        expression: `(async function () {
+          var conversations = window.wb && window.wb.conversations;
+          if (!conversations || typeof conversations.ensureList !== 'function') return false;
+          await conversations.ensureList('local', { view: 'active', page: 1, size: 100000 });
+          return true;
+        })()`,
+        awaitPromise: true,
+        returnByValue: true,
+      }),
+      // The official SDK publishes local rows first, then optionally waits for
+      // cloud folders. A slow cloud response must not hold the copy queue or
+      // delay restoring the selected conversation indefinitely.
+      new Promise(resolve => { timer = setTimeout(() => resolve(null), 2000); }),
+    ]);
+    const confirmed = response && response.result && response.result.value === true;
+    log('[' + reason + '] 列表刷新' + (confirmed ? '已完成' : '未确认；已保留本地会话数据'));
+    return confirmed;
+  } catch (_) {
+    // A disconnected renderer cannot invalidate already committed files/rows.
+    log('[' + reason + '] 列表刷新暂不可用；已保留本地会话数据');
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function refreshCopiedSessionList(job) {
+  if (!job || !(job.copied || job.partial || job.conflicts || job.openSessionId)) return false;
+  return refreshWorkBuddySessionList(job.targetUid, 'sessions-auto-copy');
 }
 
 function publicAutoCopyJob(job) {
@@ -5600,6 +6022,7 @@ function removeSessionAppCache(wbHome, id) {
 // 真实删除会话的消息文件：projects/<项目>/<id>.jsonl + <id>/、workspace/sessions/<id>/、
 // tasks/<id>/、file-history/<id>/、artifact-index/<id>.json（全部按会话 id 精确删除，不可恢复）
 function deleteSessionFiles(wbHome, id) {
+  if (codeBuddyFiles) return codeBuddyFiles.remove(id);
   if (!isValidSessionId(id)) throw new Error('无效的会话 ID');
   // 配置的数据根允许是 Windows junction；仅解析这一层，内部 managed parent 仍逐级拒绝链接。
   try { wbHome = fs.realpathSync(wbHome); }
@@ -6100,7 +6523,7 @@ async function acSendCurrentInput() {
 // 开关状态 + 短语列表持久化在 ~/.workbuddy/settings.json 的 wbs.session 域（与 noDisturb/autoContinue 同模式）。
 // 默认值：暂存提示词开、快捷短语开（属性缺省即按开处理，保证旧用户全新功能默认可用）。
 const SESS_NS = 'session';
-const SESS_SWITCHES = ['stashEnabled', 'phraseEnabled'];
+const SESS_SWITCHES = ['stashEnabled', 'phraseEnabled', 'themeTakeoverEnabled'];
 // 首次使用时播种的默认快捷短语（仅一次；用户删除后不再补——seeded 标志已置位，删除即永久生效）
 const SESS_DEFAULT_PHRASES = ['继续执行'];
 let sessionSeedPersistReported = false;
@@ -6109,6 +6532,7 @@ function sessBuild(st, phrases) {
   return {
     stashEnabled: st.stashEnabled !== false,
     phraseEnabled: st.phraseEnabled !== false,
+    themeTakeoverEnabled: st.themeTakeoverEnabled !== false,
     phrases: Array.isArray(phrases) ? phrases : [],
   };
 }
@@ -6145,20 +6569,23 @@ function readSessionState() {
       }
     }
   }
-  return sessBuild(st, phrases);
+  const result = sessBuild(st, phrases);
+  if (PROFILE.capabilities.themeTakeover === false) result.themeTakeoverEnabled = false;
+  return result;
 }
 function writeSessionState(state) {
   const s = readWorkbuddySettings();
   const prior = (s.wbs && s.wbs[SESS_NS] && typeof s.wbs[SESS_NS] === 'object') ? s.wbs[SESS_NS] : {};
   if (!s.wbs || typeof s.wbs !== 'object') s.wbs = {};
   s.wbs[SESS_NS] = {
-    state: { stashEnabled: !!state.stashEnabled, phraseEnabled: !!state.phraseEnabled },
+    state: { stashEnabled: !!state.stashEnabled, phraseEnabled: !!state.phraseEnabled, themeTakeoverEnabled: state.themeTakeoverEnabled !== false },
     phrases: state.phrases || [],
     seeded: prior.seeded !== false, // 保留播种标志（删除默认短语后不回补）
   };
   writeWorkbuddySettings(s);
 }
 function setSessionSwitch(name, enabled) {
+  if (name === 'themeTakeoverEnabled' && enabled && PROFILE.capabilities.themeTakeover === false) throw new Error('CodeBuddy 暂不支持毛玻璃主题');
   if (SESS_SWITCHES.indexOf(name) === -1) throw new Error('未知开关: ' + name);
   const st = readSessionState();
   st[name] = !!enabled;
@@ -6632,7 +7059,7 @@ function builtinWallpaperSource(baseDir, fileName) {
  * nebula 主题和背景仅在缺失时安装，避免覆盖用户后来选择的主题配色或背景。
  */
 function initBuiltinAssets() {
-  if (!PROFILE.capabilities.theme) return;
+  if (!PROFILE.capabilities.theme || PROFILE.capabilities.themeTakeover === false) return;
   try {
     const src = builtinAssetsDir();
     if (!src) {
@@ -6907,22 +7334,269 @@ function getTheme(id) {
       const sub = path.join(THEMES_DIR, safeId, 'theme.json');
       if (fs.existsSync(sub)) t = JSON.parse(fs.readFileSync(sub, 'utf8'));
     }
-    if (t && t.colors) return t;
+    if (t && t.colors) {
+      // 毛玻璃的透明常量也是主题定义的一部分；旧安装的配色文件同样生效。
+      if (id === 'nebula') t.colors = { ...t.colors,
+        '--wb-button-primary-bg': 'transparent', '--wb-bg-secondary': 'transparent',
+        '--wb-button-primary-fg': 'var(--wb-color-text-primary)',
+      };
+      return t;
+    }
   } catch (_) {}
   if (BUILTIN_THEMES[id]) return BUILTIN_THEMES[id];
   return null;
 }
 
+// 在官方加载目标账号前迁移当前外观。WorkBuddy syncCloudTheme 优先消费
+// currentTheme + pendingSync.theme，再由官方队列同步云端；只写 currentTheme
+// 会被启动时的旧云端选择覆盖。这里不安装 hook，也不改其他账号或皮肤 CSS。
+function accountSwitchThemeExpression(targetUid) {
+  return `(async function () {
+    var uid = ${JSON.stringify(targetUid)};
+    if (typeof uid !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(uid)) return { prepared: false };
+    var theme;
+    try { theme = JSON.parse(localStorage.getItem('workbuddy.appearance.lastApplied') || 'null'); } catch (_) {}
+    if (!theme || typeof theme.resourceKey !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(theme.resourceKey)) return { prepared: false };
+    // 官方跨窗口初始化会把 appearanceTheme 写回当前账号并清掉 pendingSync。
+    // 仅清这个旧的跨窗口缓存，让账号状态与待同步选择成为启动依据；后续手动
+    // 换肤仍会由官方 setPreference 写入新的值，不需要拦截或替换任何函数。
+    if (typeof globalThis.wb?.config?.setPreference === 'function') {
+      await globalThis.wb.config.setPreference('appearanceTheme', null);
+    }
+    var resource = theme.resourceKey;
+    var mode = theme.appearance === 'dark' || resource === 'dark' ? 'dark' : 'light';
+    var statePrefix = 'workbuddy.appearance.state::';
+    var lastPrefix = 'workbuddy.appearance.lastApplied::';
+    var modePrefix = 'workbuddy.appearance.mode::';
+    var suffix = '::' + uid;
+    var scopes = new Set(['personal']);
+    var modeKeys = new Set([modePrefix + 'personal::personal' + suffix]);
+    for (var i = 0; i < localStorage.length; i++) {
+      var key = localStorage.key(i);
+      if (!key || !key.endsWith(suffix)) continue;
+      if (key.indexOf(statePrefix) === 0) scopes.add(key.slice(statePrefix.length, -suffix.length));
+      else if (key.indexOf(lastPrefix) === 0) scopes.add(key.slice(lastPrefix.length, -suffix.length));
+      else if (key.indexOf(modePrefix) === 0) {
+        modeKeys.add(key);
+        var namespace = key.slice(modePrefix.length, -suffix.length).split('::');
+        if (namespace.length === 2 && namespace[1]) scopes.add(namespace[1]);
+      }
+    }
+    scopes.forEach(function (scope) {
+      var key = statePrefix + scope + suffix, previous = {};
+      try { previous = JSON.parse(localStorage.getItem(key) || '{}') || {}; } catch (_) {}
+      var state = Object.assign({}, previous, { currentTheme: resource,
+        pendingSync: Object.assign({}, previous.pendingSync, { theme: resource }) });
+      localStorage.setItem(key, JSON.stringify(state));
+      localStorage.setItem(lastPrefix + scope + suffix, JSON.stringify(theme));
+    });
+    modeKeys.forEach(function (key) { localStorage.setItem(key, mode); });
+    return { prepared: true };
+  })()`;
+}
+
+async function preserveAccountSwitchTheme(targetUid) {
+  if (!PROFILE.capabilities.theme || PROFILE.capabilities.themeTakeover === false || !cdp.connected) return false;
+  try {
+    const result = await cdpSend('Runtime.evaluate', {
+      expression: accountSwitchThemeExpression(targetUid), returnByValue: true, awaitPromise: true, timeout: 1500,
+    });
+    return !!(result && !result.exceptionDetails && result.result && result.result.value && result.result.value.prepared);
+  } catch (_) {
+    // 外观迁移失败不阻断登录文件切换；不输出账号配置、皮肤资源或 CDP 异常内容。
+    log('[theme] 切换前外观同步未完成');
+    return false;
+  }
+}
+
+// WorkBuddy 的外观设置在独立窗口中运行。关闭接管后，主会话窗口不会
+// 自动收到特殊皮肤的 adoptedStyleSheet，因此只同步 WorkBuddy 自己保存
+// 的 CSS 资源；浅色/深色仍由 WorkBuddy 原生状态负责。
+function nativeAppearanceSyncExpression() {
+  return `(function () {
+    var h = null, b = null;
+    function removeNativeSheet() {
+      try {
+        var own = window.__wbsNativeAppearanceSheet;
+        if (!own || !document.adoptedStyleSheets) return;
+        document.adoptedStyleSheets = Array.from(document.adoptedStyleSheets).filter(function (sheet) { return sheet !== own; });
+      } catch (_) {}
+      try { delete window.__wbsNativeAppearanceSheet; delete window.__wbsNativeAppearanceKey; } catch (_) {}
+    }
+    function setAttr(el, name, value) {
+      // 同值 setAttribute 也会触发 MutationObserver（WorkBuddy ThemeManager 据此重应用主题），
+      // 幂等写入避免与官方主题机制互相惊动形成无限回写。
+      if (el.getAttribute(name) !== value) el.setAttribute(name, value);
+    }
+    function setMode(mode) {
+      var dark = mode === 'dark';
+      setAttr(h, 'data-theme', mode);
+      h.classList.toggle('cb-dark', dark); h.classList.toggle('cb-light', !dark);
+      h.classList.toggle('dark', dark); h.classList.toggle('light', !dark);
+      setAttr(b, 'data-vscode-theme-kind', dark ? 'vscode-dark' : 'vscode-light');
+      setAttr(b, 'data-vscode-theme-name', dark ? 'IDE Night' : 'IDE Light');
+      b.classList.toggle('vscode-dark', dark); b.classList.toggle('vscode-light', !dark);
+      b.classList.toggle('cb-dark', dark); b.classList.toggle('cb-light', !dark);
+      b.classList.toggle('dark', dark); b.classList.toggle('light', !dark);
+    }
+    function sync() {
+      h = document.documentElement; b = document.body;
+      if (!h || !b) return;
+      var applied = null, cssState = null, native = null;
+      try { applied = JSON.parse(localStorage.getItem('workbuddy.appearance.lastApplied') || 'null'); } catch (_) {}
+      try { cssState = JSON.parse(localStorage.getItem('workbuddy.appearance.lastApplied.css') || 'null'); } catch (_) {}
+      // WorkBuddy AI 的原生浅色/深色设置由 ThemeManager 写入 agent-ui-theme；
+      // appearance.lastApplied 只在外观面板/皮肤流程中更新。若优先读取后者，
+      // 关闭 WorkDaddy 接管后官方刚选的浅色/深色会被旧快照每 500ms 改回。
+      try { native = JSON.parse(localStorage.getItem('agent-ui-theme') || 'null'); } catch (_) {}
+      var resource = String((cssState && cssState.resourceKey) || (applied && applied.resourceKey) || '');
+      var css = String((cssState && cssState.css) || '');
+      var special = resource && resource !== 'light' && resource !== 'dark' && css;
+      var nativeMode = native && (native.theme === 'light' || native.theme === 'dark') ? native.theme : null;
+      if (special && typeof CSSStyleSheet !== 'undefined' && document.adoptedStyleSheets) {
+        var key = resource + ':' + css.length;
+        var currentSheets = Array.from(document.adoptedStyleSheets || []);
+        var ownSheetPresent = window.__wbsNativeAppearanceSheet && currentSheets.indexOf(window.__wbsNativeAppearanceSheet) >= 0;
+        if (window.__wbsNativeAppearanceKey !== key || !ownSheetPresent) {
+          removeNativeSheet();
+          try {
+            var sheet = new CSSStyleSheet();
+            sheet.replaceSync(css);
+            document.adoptedStyleSheets = Array.from(document.adoptedStyleSheets || []).concat([sheet]);
+            window.__wbsNativeAppearanceSheet = sheet;
+            window.__wbsNativeAppearanceKey = key;
+          } catch (_) {}
+        }
+        setMode(applied && applied.appearance === 'dark' ? 'dark' : 'light');
+        return;
+      }
+      removeNativeSheet();
+      setMode(nativeMode || (resource === 'dark' || (applied && applied.appearance === 'dark') ? 'dark' : 'light'));
+    }
+    sync();
+    try {
+      // 释放接管后可能仍有旧版/并发应用泄漏的 250ms 外观守护在跑；bump token
+      // 让它们下一次 fire 时自杀，避免用陈旧 wantedMode 与原生外观无限拉扯。
+      window.__wbsThemeAppearanceGuardToken = (window.__wbsThemeAppearanceGuardToken || 0) + 1;
+      if (window.__wbsNativeAppearanceSync) clearInterval(window.__wbsNativeAppearanceSync);
+      window.__wbsNativeAppearanceSync = setInterval(sync, 500);
+    } catch (_) {}
+  })()`;
+}
+
+async function startNativeAppearanceSyncByCdp() {
+  if (!cdp.connected || readSessionState().themeTakeoverEnabled !== false) return;
+  await cdpSend('Runtime.evaluate', { expression: nativeAppearanceSyncExpression(), returnByValue: true });
+}
+
+async function releaseThemeByCdp() {
+  themeApplyGeneration++;
+  if (!cdp.connected) return;
+  const releaseGeneration = themeApplyGeneration;
+  // 先释放 WorkDaddy 注入，再恢复接管前保存的 WorkBuddy 外观；没有快照时
+  // 才由官方同步流程决定当前主题。
+  const result = await applyThemeByCdp('default', { release: true });
+  if (releaseGeneration === themeApplyGeneration) {
+    await restoreNativeAppearanceByCdp();
+    if (releaseGeneration === themeApplyGeneration) await startNativeAppearanceSyncByCdp();
+  }
+  return result;
+}
+
+async function restoreNativeAppearanceByCdp() {
+  if (!cdp.connected) return;
+  let _accUid = null;
+  try { const _a = currentAccount(); _accUid = _a ? _a.uid : null; } catch (_) {}
+  const uid = (typeof _accUid === 'string' && _accUid) ? _accUid : null;
+  if (!uid) return;
+  try {
+    await cdpSend('Runtime.evaluate', {
+      expression: `(async function () {
+        var WBS_UID = ${JSON.stringify(uid)};
+        // 多账号文件同时存在时 daemon 可能无法唯一解析当前 auth；页面 URL
+        // 仍带有 WorkBuddy 正在展示的 accountSnapshot，优先用它定位快照。
+        try {
+          var rawAccount = new URL(location.href).searchParams.get('accountSnapshot');
+          for (var decodeAttempt = 0; rawAccount && decodeAttempt < 3; decodeAttempt++) {
+            try { rawAccount = decodeURIComponent(rawAccount); } catch (_) { break; }
+          }
+          var pageAccount = JSON.parse(rawAccount || 'null');
+          if (pageAccount && /^[A-Za-z0-9_-]{1,160}$/.test(String(pageAccount.uid || ''))) WBS_UID = String(pageAccount.uid);
+        } catch (_) {}
+        var snapshotKey = 'workdaddy.theme.native-snapshot::' + WBS_UID;
+        var rawSnapshot = localStorage.getItem(snapshotKey);
+        if (!rawSnapshot) return { restored: false };
+        var snapshot = JSON.parse(rawSnapshot);
+        var suffix = '::' + WBS_UID;
+        var removeKeys = [];
+        for (var i = 0; i < localStorage.length; i++) {
+          var k = localStorage.key(i);
+          if (!k) continue;
+          if ((k.indexOf('workbuddy.appearance.mode::') === 0 ||
+               k.indexOf('workbuddy.appearance.state::') === 0 ||
+               k.indexOf('workbuddy.appearance.lastApplied::') === 0) && k.endsWith(suffix)) removeKeys.push(k);
+        }
+        for (var r = 0; r < removeKeys.length; r++) localStorage.removeItem(removeKeys[r]);
+        var globalKeys = ['agent-ui-theme', 'workbuddy.appearance.lastApplied', 'workbuddy.appearance.lastApplied.css', 'workbuddy.appearance.lastApplied::__identity'];
+        for (var g = 0; g < globalKeys.length; g++) localStorage.removeItem(globalKeys[g]);
+        var saved = Array.isArray(snapshot.keys) ? snapshot.keys : [];
+        var savedMap = {};
+        for (var s = 0; s < saved.length; s++) if (Array.isArray(saved[s]) && saved[s].length >= 2) { savedMap[saved[s][0]] = saved[s][1]; localStorage.setItem(saved[s][0], saved[s][1]); }
+        // WorkBuddy's official cross-window appearance sync consumes a resource
+        // key through config.setPreference. Restoring localStorage alone leaves
+        // the renderer's ThemeManager on the temporary light/dark base theme,
+        // so special themes such as "有风" never rebuild their real variables.
+        // Prefer the global snapshot, then fall back to the current account's
+        // scoped lastApplied entry when older snapshots lack the global key.
+        var savedTheme = null;
+        try { savedTheme = JSON.parse(savedMap['workbuddy.appearance.lastApplied'] || 'null'); } catch (_) {}
+        if (!savedTheme || typeof savedTheme.resourceKey !== 'string') {
+          for (var savedKey in savedMap) {
+            if (savedKey.indexOf('workbuddy.appearance.lastApplied::') !== 0 || !savedKey.endsWith(suffix)) continue;
+            try {
+              var scopedTheme = JSON.parse(savedMap[savedKey] || 'null');
+              if (scopedTheme && typeof scopedTheme.resourceKey === 'string') { savedTheme = scopedTheme; break; }
+            } catch (_) {}
+          }
+        }
+        var reapplied = false;
+        if (savedTheme && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(savedTheme.resourceKey) &&
+            typeof globalThis.wb?.config?.setPreference === 'function') {
+          try {
+            await globalThis.wb.config.setPreference('appearanceTheme', savedTheme.resourceKey);
+            reapplied = true;
+          } catch (_) {}
+        }
+        // Preserve the saved WorkBuddy resource key and CSS payload verbatim;
+        // special appearances must remain selectable after takeover is off.
+        localStorage.removeItem(snapshotKey);
+        return { restored: true, reapplied: reapplied,
+          resourceKey: savedTheme && savedTheme.resourceKey || null };
+      })()`,
+      returnByValue: true, awaitPromise: true,
+    });
+    await startNativeAppearanceSyncByCdp();
+  } catch (_) {}
+}
+
+function readSavedThemeId() {
+  try {
+    const id = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'current-theme.json'), 'utf8')).id;
+    if (typeof id === 'string' && (id === 'default' || getTheme(id))) return id;
+  } catch (_) {}
+  return 'default';
+}
+
 /** 恢复已保存的主题（CDP 连接/页面刷新后调用）：读取 current-theme.json 重新应用，保证深浅色在重启/刷新后仍生效 */
 async function restoreSavedTheme() {
-  if (!PROFILE.capabilities.theme) return;
+  if (!PROFILE.capabilities.theme || PROFILE.capabilities.themeTakeover === false) return;
   if (!cdp.connected) return;
-  let id = 'default';
-  try {
-    const f = path.join(DATA_DIR, 'current-theme.json');
-    if (fs.existsSync(f)) id = String(JSON.parse(fs.readFileSync(f, 'utf8')).id || 'default');
-  } catch (_) {}
-  await applyThemeByCdp(id);
+  if (readSessionState().themeTakeoverEnabled === false) {
+    // 重载/重连时保留官方选择，不能再次触发关闭开关的一次性浅色重置。
+    await startNativeAppearanceSyncByCdp();
+    return;
+  }
+  await applyThemeByCdp(readSavedThemeId(), { automatic: true });
 }
 
 /** 应用主题：通过 CDP 注入主题样式。
@@ -7006,10 +7680,11 @@ function themeVarsCss(isDark, id) {
   let out = '';
   const declOf = (vars) => Object.keys(vars || {}).map((k) => k + ':' + vars[k] + ';').join('');
   for (const b of mod.body || []) {
+    if (b.themeId && b.themeId !== id) continue;
     if (b.darkOnly && !isDark) continue;
     const lead = b.darkOnly ? pre : '';
     const d = declOf(b.vars);
-    if (d) out += lead + 'body[data-vscode-theme-name]{' + d + '}';
+    if (d) out += (b.includeRoot ? 'html[data-wbs-theme-id],' : '') + lead + 'body[data-vscode-theme-name]{' + d + '}';
   }
   for (const s of mod.scoped || []) {
     if (s.themeId && s.themeId !== id) continue;
@@ -7033,9 +7708,38 @@ function readBackgroundBlur() {
   return blur;
 }
 
-async function applyThemeByCdp(id) {
-  if (!PROFILE.capabilities.theme) throw new Error(`${PROFILE.name} 暂不支持主题功能`);
+async function applyThemeByCdp(id, options = {}) {
+  if (!PROFILE.capabilities.theme || PROFILE.capabilities.themeTakeover === false) throw new Error(`${PROFILE.name} 暂不支持毛玻璃主题`);
+  if (options.release && readSessionState().themeTakeoverEnabled !== false) return { applied: false, takeover: true };
+  if (options.automatic && readSessionState().themeTakeoverEnabled === false) return { applied: false, takeover: false };
+  if (!options.automatic && !options.nativeOnly && !options.release) themeApplyGeneration++;
+  const applyGeneration = themeApplyGeneration;
   if (!cdp.connected) throw new Error('CDP 未连接');
+  const takeoverEnabled = !options.nativeOnly && readSessionState().themeTakeoverEnabled !== false;
+  if (id === 'nebula' && takeoverEnabled) {
+    // 分开两个 CDP 回合：释放自定义 CSS/守护，让官方深色真正渲染，再接管毛玻璃。
+    // 不改持久化接管开关，避免中途失败或并发操作留下错误的用户设置。
+    await applyThemeByCdp('dark', { ...options, nativeOnly: true });
+    if (applyGeneration !== themeApplyGeneration || readSessionState().themeTakeoverEnabled === false) return { applied: false, cancelled: true };
+    // Electron 后台窗口会节流 setTimeout/暂停 rAF；由 daemon 等待，
+    // 再同步检查官方底色，不能让开关响应依赖 renderer 的下一帧。
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    if (applyGeneration !== themeApplyGeneration || readSessionState().themeTakeoverEnabled === false) return { applied: false, cancelled: true };
+    const settled = await cdpSend('Runtime.evaluate', {
+      expression: `(function () {
+          var native = null;
+          try { native = JSON.parse(localStorage.getItem('agent-ui-theme') || 'null'); } catch (_) {}
+          return { ready: document.documentElement.getAttribute('data-theme') === 'dark' &&
+            document.body.getAttribute('data-vscode-theme-name') === 'IDE Night' &&
+            native && native.theme === 'dark' && !document.documentElement.hasAttribute('data-skin') &&
+            document.documentElement.style.colorScheme === 'dark' &&
+            !document.getElementById('wbs-theme-style') && !window.__wbsThemeGuard };
+      })()`,
+      returnByValue: true, timeout: 2000,
+    });
+    if (applyGeneration !== themeApplyGeneration || readSessionState().themeTakeoverEnabled === false) return { applied: false, cancelled: true };
+    if (!settled || settled.exceptionDetails || !settled.result || !settled.result.value || !settled.result.value.ready) throw new Error('官方深色主题尚未就绪，请重试毛玻璃主题');
+  }
   let _accUid = null;
   try { const _a = currentAccount(); _accUid = _a ? _a.uid : null; } catch (_) {}
   const uid = (typeof _accUid === 'string' && _accUid) ? _accUid : null;
@@ -7125,8 +7829,32 @@ async function applyThemeByCdp(id) {
   const expr = `(function(){
     var h = document.documentElement, b = document.body;
     if (!h || !b) return { pending: true };
+    try {
+      if (window.__wbsNativeAppearanceSync) clearInterval(window.__wbsNativeAppearanceSync);
+      var nativeSheet = window.__wbsNativeAppearanceSheet;
+      if (nativeSheet && document.adoptedStyleSheets) document.adoptedStyleSheets = Array.from(document.adoptedStyleSheets).filter(function (sheet) { return sheet !== nativeSheet; });
+      delete window.__wbsNativeAppearanceSync; delete window.__wbsNativeAppearanceSheet; delete window.__wbsNativeAppearanceKey;
+    } catch (_) {}
     if (window.__wbsThemeGuard) window.__wbsThemeGuard.disconnect();
+    delete window.__wbsThemeGuard;
+    // 清理上一次应用遗留的 250ms 外观守护：历史上这里只覆盖 window 上的句柄，
+    // 并发/重复应用会泄漏旧 interval（10s 自停读的是共享 window 句柄，只有最后一个能被清），
+    // 泄漏的守护用陈旧 wantedMode 持续回写 DOM/localStorage，是关闭接管后主题无限来回切换的根因。
+    try { if (window.__wbsThemeAppearanceGuard) clearInterval(window.__wbsThemeAppearanceGuard); } catch (_) {}
+    try { if (window.__wbsThemeAppearanceGuardStop) clearTimeout(window.__wbsThemeAppearanceGuardStop); } catch (_) {}
+    try {
+      delete window.__wbsThemeAppearanceGuard; delete window.__wbsThemeAppearanceGuardStop;
+      window.__wbsThemeAppearanceGuardToken = (window.__wbsThemeAppearanceGuardToken || 0) + 1;
+    } catch (_) {}
     var WBS_UID = ${JSON.stringify(uid || null)};
+    try {
+      var rawAccount = new URL(location.href).searchParams.get('accountSnapshot');
+      for (var decodeAttempt = 0; rawAccount && decodeAttempt < 3; decodeAttempt++) {
+        try { rawAccount = decodeURIComponent(rawAccount); } catch (_) { break; }
+      }
+      var pageAccount = JSON.parse(rawAccount || 'null');
+      if (pageAccount && /^[A-Za-z0-9_-]{1,160}$/.test(String(pageAccount.uid || ''))) WBS_UID = String(pageAccount.uid);
+    } catch (_) {}
     // WorkDaddy 自定义主题已应用标记：theme-patches 里部分规则用 html[data-wbs-theme] 限定
     // 只在 WorkDaddy 内置自定义主题下生效（官方默认主题不激活）。
     try { h.setAttribute('data-wbs-theme', ${id === 'default' || id === 'dark' ? "'0'" : "'1'"}); } catch (e) {}
@@ -7139,24 +7867,123 @@ async function applyThemeByCdp(id) {
     //    会按账号原偏好（如 dark）恢复并覆盖我们的设置 —— 这是面板切主题被"弹回"的根因；
     // 4) 设置 body[data-vscode-theme-kind]，触发 ThemeManager 的 MutationObserver（syncThemeClassesFromAttribute），
     //    让 WorkBuddy 内部 useTheme hook / 组件 theme prop 实时跟随，等价调用原生 setTheme()。
-    function wbsSyncAppearanceKeys(mode) {
+    function wbsBuiltinAppearance(mode) {
+      return {
+        kind: 'theme',
+        resourceKey: mode,
+        nameZh: mode === 'dark' ? '深色' : '浅色',
+        nameEn: mode === 'dark' ? 'Dark' : 'Light',
+        vipLevel: 'free',
+        updatedAt: 0,
+        series: 'base',
+        appearance: mode,
+      };
+    }
+    function wbsSnapshotNativeAppearance() {
+      if (!WBS_UID || ${options.release ? 'true' : 'false'}) return;
       try {
-        // 覆盖所有已存在的账号外观键（mode 存裸 'light'/'dark'，state 存 {currentTheme}）
+        var snapshotKey = 'workdaddy.theme.native-snapshot::' + WBS_UID;
+        if (localStorage.getItem(snapshotKey)) return;
+        var keys = [];
+        var suffix = '::' + WBS_UID;
         for (var i = 0; i < localStorage.length; i++) {
           var k = localStorage.key(i);
-          if (typeof k !== 'string') continue;
+          if (!k) continue;
+          if ((k.indexOf('workbuddy.appearance.mode::') === 0 ||
+               k.indexOf('workbuddy.appearance.state::') === 0 ||
+               k.indexOf('workbuddy.appearance.lastApplied::') === 0) && k.endsWith(suffix)) {
+            keys.push([k, localStorage.getItem(k)]);
+          }
+        }
+        var globalKeys = ['agent-ui-theme', 'workbuddy.appearance.lastApplied', 'workbuddy.appearance.lastApplied.css', 'workbuddy.appearance.lastApplied::__identity'];
+        for (var g = 0; g < globalKeys.length; g++) {
+          var gv = localStorage.getItem(globalKeys[g]);
+          if (gv !== null) keys.push([globalKeys[g], gv]);
+        }
+        localStorage.setItem(snapshotKey, JSON.stringify({ keys: keys, at: Date.now() }));
+      } catch (_) {}
+    }
+    function wbsClearNativeCustomCss() {
+      // ThemeManager 遇到 data-skin 会直接跳过主题同步；即使皮肤 CSS 已清空，
+      // 也必须先解除这个标记，再发出 theme-kind 通知，才能更新官方组件状态。
+      var skinId = h.getAttribute('data-skin');
+      h.removeAttribute('data-skin');
+      try {
+        if (document.querySelectorAll) document.querySelectorAll('style[data-skin-sheet]').forEach(function (sheet) { sheet.textContent = ''; });
+        var raw = localStorage.getItem('workbuddy.appearance.lastApplied.css');
+        var cssState = null;
+        var applied = null;
+        try { cssState = JSON.parse(raw || 'null'); } catch (_) {}
+        try { applied = JSON.parse(localStorage.getItem('workbuddy.appearance.lastApplied') || 'null'); } catch (_) {}
+        var css = String((cssState || {}).css || '');
+        var resourceKey = String(skinId || (cssState || {}).resourceKey || (applied || {}).resourceKey || '');
+        var special = !!resourceKey && resourceKey !== 'light' && resourceKey !== 'dark';
+        if ((!css && !special) || !document.adoptedStyleSheets || !document.adoptedStyleSheets.length) return;
+        var kept = [];
+        for (var i = 0; i < document.adoptedStyleSheets.length; i++) {
+          var sheet = document.adoptedStyleSheets[i];
+          var text = '';
+          try { text = Array.from(sheet.cssRules || []).map(function (rule) { return rule.cssText; }).join('\\n'); } catch (_) {}
+          // CSSOM serialization may differ from the downloaded CSS. When the
+          // active resource is a special skin, WorkBuddy theme variables give
+          // us a stable marker for the adopted sheet.
+          var looksLikeCustomSkin = special && (
+            text.indexOf('--cb-bg-primary') !== -1 ||
+            text.indexOf('--wb-bg-primary') !== -1 ||
+            text.indexOf('--cb-color') !== -1
+          );
+          if (text !== css && !looksLikeCustomSkin) kept.push(sheet);
+          else if (typeof sheet.replaceSync === 'function') {
+            // 官方 SkinManager 持有这张 sheet；保留挂载，避免后续官方换肤写入
+            // 一张已被我们移除的 sheet，表现为“怎么切都没有效果”。
+            sheet.replaceSync(''); kept.push(sheet);
+          }
+        }
+        if (kept.length !== document.adoptedStyleSheets.length) document.adoptedStyleSheets = kept;
+      } catch (_) {}
+    }
+    function wbsWriteAppearanceState(key, mode) {
+      var state = {};
+      try { state = JSON.parse(localStorage.getItem(key) || '{}') || {}; } catch (_) {}
+      state.currentTheme = mode;
+      // 切换账号前留下的官方待同步状态必须保留到云端初始化完成。
+      if (state.pendingSync && state.pendingSync.theme) state.pendingSync.theme = mode;
+      localStorage.setItem(key, JSON.stringify(state));
+    }
+    function wbsSyncAppearanceKeys(mode) {
+      try {
+        if (!WBS_UID) return;
+        wbsSnapshotNativeAppearance();
+        var builtin = wbsBuiltinAppearance(mode);
+        var accountLastAppliedFound = false;
+        for (var i = 0; i < localStorage.length; i++) {
+          var k = localStorage.key(i);
+          if (typeof k !== 'string' || !k.endsWith('::' + WBS_UID)) continue;
           if (k.indexOf('workbuddy.appearance.mode::') === 0) {
             localStorage.setItem(k, mode);
           } else if (k.indexOf('workbuddy.appearance.state::') === 0) {
-            try { localStorage.setItem(k, JSON.stringify({ currentTheme: mode })); } catch (e3) {}
+            try { wbsWriteAppearanceState(k, mode); } catch (e3) {}
+          } else if (k.indexOf('workbuddy.appearance.lastApplied::') === 0) {
+            try { localStorage.setItem(k, JSON.stringify(builtin)); accountLastAppliedFound = true; } catch (e4) {}
           }
         }
         // 当前账号兜底键（个人版默认 accountType=personal、eid=personal），保证新账号也跟随
         if (WBS_UID) {
           localStorage.setItem('workbuddy.appearance.mode::personal::personal::' + WBS_UID, mode);
-          try { localStorage.setItem('workbuddy.appearance.state::personal::' + WBS_UID, JSON.stringify({ currentTheme: mode })); } catch (e4) {}
+          try { wbsWriteAppearanceState('workbuddy.appearance.state::personal::' + WBS_UID, mode); } catch (e5) {}
+          if (!accountLastAppliedFound) {
+            try { localStorage.setItem('workbuddy.appearance.lastApplied::personal::' + WBS_UID, JSON.stringify(builtin)); } catch (e6) {}
+          }
         }
-      } catch (e5) {}
+      } catch (e7) {}
+    }
+    function wbsPrepareNativeAppearance(mode) {
+      // 先清理官方特殊皮肤，再切换官方底色；毛玻璃直接用深色打底。
+      wbsSnapshotNativeAppearance();
+      wbsClearNativeCustomCss();
+      wbsSyncNativeTheme(mode);
+      h.classList.toggle('cb-dark', mode === 'dark');
+      b.classList.toggle('vscode-dark', mode === 'dark');
     }
     function wbsSyncNativeTheme(mode) {
       var isLight = mode === 'light';
@@ -7164,12 +7991,31 @@ async function applyThemeByCdp(id) {
       var name = isLight ? 'IDE Light' : 'IDE Night';
       try {
         localStorage.setItem('agent-ui-theme', JSON.stringify({ theme: mode, followSystem: false, vsCodeThemeName: name, vsCodeThemeKind: kind }));
-        try { localStorage.setItem('workbuddy.appearance.lastApplied', JSON.stringify({ appearance: mode })); } catch (e2) {}
+        try { localStorage.setItem('workbuddy.appearance.lastApplied', JSON.stringify(wbsBuiltinAppearance(mode))); } catch (e2) {}
         wbsSyncAppearanceKeys(mode);
       } catch (e1) {}
       b.setAttribute('data-vscode-theme-kind', kind);
       b.setAttribute('data-vscode-theme-name', name);
       h.setAttribute('data-theme', mode);
+    }
+    // wbsSyncNativeThemeIdempotent：250ms 守护/keeper 的周期调用路径，属性同值时不写。
+    function wbsSyncNativeThemeQuiet(mode) {
+      var isLight = mode === 'light';
+      var kind = isLight ? 'vscode-light' : 'vscode-dark';
+      var name = isLight ? 'IDE Light' : 'IDE Night';
+      if (h.getAttribute('data-theme') === mode &&
+          b.getAttribute('data-vscode-theme-kind') === kind &&
+          b.getAttribute('data-vscode-theme-name') === name) return false;
+      wbsSyncNativeTheme(mode);
+      return true;
+    }
+    if (${takeoverEnabled || options.release || options.nativeOnly ? 'true' : 'false'}) wbsPrepareNativeAppearance(${JSON.stringify(id === 'nebula' || options.nativeOnly ? 'dark' : 'light')});
+    if (${options.release || options.nativeOnly ? 'true' : 'false'}) {
+      wbsClearNativeCustomCss();
+        // 清掉特殊皮肤缓存；外观快照留给 releaseThemeByCdp 立即恢复。
+        try {
+          localStorage.removeItem('workbuddy.appearance.lastApplied.css');
+        } catch (_) {}
     }
     var s = document.getElementById('wbs-theme-style');
     if (${id === 'default' || id === 'dark' ? 'true' : 'false'}) {
@@ -7211,19 +8057,87 @@ async function applyThemeByCdp(id) {
     function keepSelectedTheme() {
       if (h.getAttribute('data-theme') === wantedMode &&
           h.classList.contains('cb-dark') === wantedDark &&
+          h.classList.contains('cb-light') === !wantedDark &&
+          h.classList.contains('dark') === wantedDark &&
+          h.classList.contains('light') === !wantedDark &&
+          h.classList.contains('vscode-dark') === wantedDark &&
+          h.classList.contains('vscode-light') === !wantedDark &&
           b.getAttribute('data-vscode-theme-kind') === wantedKind &&
           b.getAttribute('data-vscode-theme-name') === wantedName &&
-          b.classList.contains('vscode-dark') === wantedDark) return;
+          b.classList.contains('vscode-dark') === wantedDark &&
+          b.classList.contains('vscode-light') === !wantedDark &&
+          b.classList.contains('cb-dark') === wantedDark &&
+          b.classList.contains('cb-light') === !wantedDark &&
+          b.classList.contains('dark') === wantedDark &&
+          b.classList.contains('light') === !wantedDark) return;
       h.classList.toggle('cb-dark', wantedDark);
+      h.classList.toggle('cb-light', !wantedDark);
+      h.classList.toggle('dark', wantedDark);
+      h.classList.toggle('light', !wantedDark);
+      h.classList.toggle('vscode-dark', wantedDark);
+      h.classList.toggle('vscode-light', !wantedDark);
       b.classList.toggle('vscode-dark', wantedDark);
+      b.classList.toggle('vscode-light', !wantedDark);
+      b.classList.toggle('cb-dark', wantedDark);
+      b.classList.toggle('cb-light', !wantedDark);
+      b.classList.toggle('dark', wantedDark);
+      b.classList.toggle('light', !wantedDark);
       wbsSyncNativeTheme(wantedMode);
     }
     keepSelectedTheme();
-    if (typeof MutationObserver !== 'undefined') {
+    if (${takeoverEnabled ? 'true' : 'false'} && typeof MutationObserver !== 'undefined') {
       var guard = new MutationObserver(keepSelectedTheme);
       guard.observe(h, { attributes: true, attributeFilter: ['class', 'data-theme'] });
       guard.observe(b, { attributes: true, attributeFilter: ['class', 'data-vscode-theme-kind', 'data-vscode-theme-name'] });
       window.__wbsThemeGuard = guard;
+    }
+    if (${takeoverEnabled ? 'true' : 'false'} && WBS_UID && typeof setInterval === 'function') {
+      function wbsHasSpecialNativeAppearance() {
+        try {
+          var globalCss = null;
+          try { globalCss = JSON.parse(localStorage.getItem('workbuddy.appearance.lastApplied.css') || 'null'); } catch (_) {}
+          if (globalCss && globalCss.resourceKey && globalCss.resourceKey !== 'light' && globalCss.resourceKey !== 'dark') return true;
+          var globalApplied = null;
+          try { globalApplied = JSON.parse(localStorage.getItem('workbuddy.appearance.lastApplied') || 'null'); } catch (_) {}
+          if (globalApplied && globalApplied.resourceKey && globalApplied.resourceKey !== 'light' && globalApplied.resourceKey !== 'dark') return true;
+          var suffix = '::' + WBS_UID;
+          for (var i = 0; i < localStorage.length; i++) {
+            var k = localStorage.key(i);
+            if (!k || !k.endsWith(suffix)) continue;
+            if (k.indexOf('workbuddy.appearance.lastApplied::') === 0) {
+              var item = null;
+              try { item = JSON.parse(localStorage.getItem(k) || 'null'); } catch (_) {}
+              if (item && item.resourceKey && item.resourceKey !== 'light' && item.resourceKey !== 'dark') return true;
+            } else if (k.indexOf('workbuddy.appearance.state::') === 0) {
+              var state = null;
+              try { state = JSON.parse(localStorage.getItem(k) || 'null'); } catch (_) {}
+              if (state && state.currentTheme && state.currentTheme !== wantedMode && state.currentTheme !== 'light' && state.currentTheme !== 'dark') return true;
+            }
+          }
+        } catch (_) {}
+        return false;
+      }
+      function wbsHoldNativeAppearance() {
+        if (!wbsHasSpecialNativeAppearance()) return;
+        wbsClearNativeCustomCss();
+        wbsSyncNativeThemeQuiet(wantedMode);
+        keepSelectedTheme();
+      }
+      wbsHoldNativeAppearance();
+      // token + 闭包句柄双保险：任何并发/重复应用都不会泄漏旧 interval；
+      // 万一泄漏（如被新版 token 顶替），旧 interval 下一次 fire 即自杀。
+      var wbsGuardToken = (window.__wbsThemeAppearanceGuardToken = (window.__wbsThemeAppearanceGuardToken || 0) + 1);
+      var wbsGuardInterval = setInterval(function () {
+        if (window.__wbsThemeAppearanceGuardToken !== wbsGuardToken) { try { clearInterval(wbsGuardInterval); } catch (_) {} return; }
+        wbsHoldNativeAppearance();
+      }, 250);
+      window.__wbsThemeAppearanceGuard = wbsGuardInterval;
+      window.__wbsThemeAppearanceGuardStop = setTimeout(function () {
+        try { clearInterval(wbsGuardInterval); } catch (_) {}
+        if (window.__wbsThemeAppearanceGuard === wbsGuardInterval) {
+          try { delete window.__wbsThemeAppearanceGuard; delete window.__wbsThemeAppearanceGuardStop; } catch (_) {}
+        }
+      }, 10000);
     }
     var cs = getComputedStyle(b);
     return { applied: ${id === 'default' ? 'false' : 'true'}, dark: ${isDark ? 'true' : 'false'}, bg: cs.getPropertyValue('--vscode-editor-background').trim(), text: cs.getPropertyValue('--vscode-editor-foreground').trim() };
@@ -7240,6 +8154,10 @@ async function applyThemeByCdp(id) {
       } else if (attempt) {
         await cdpActivatePage();
       }
+      // 重连重试也必须服从后续主题选择或关闭接管，不能把过期阶段重新应用。
+      if (applyGeneration !== themeApplyGeneration) return { applied: false, cancelled: true };
+      if (options.release && (readSessionState().themeTakeoverEnabled !== false || applyGeneration !== themeApplyGeneration)) return { applied: false, takeover: readSessionState().themeTakeoverEnabled !== false };
+      if (options.automatic && (readSessionState().themeTakeoverEnabled === false || applyGeneration !== themeApplyGeneration)) return { applied: false, takeover: false };
       r = await cdpSend('Runtime.evaluate', { expression: expr, returnByValue: true });
       if (r && r.exceptionDetails) {
         const detail = r.exceptionDetails.exception && r.exceptionDetails.exception.description;
@@ -7432,7 +8350,38 @@ async function sendStashToComposer(record) {
   const clrV = clr.result && clr.result.value;
   if (!clrV || !clrV.ok) throw new Error((clrV && clrV.error) || '无法聚焦输入框');
   if (record.requireEmpty && clrV.hasContent) throw new Error('会话输入框非空，未覆盖草稿、未发送');
-  if (clrV.hasContent) {
+  // CodeBuddy's Slate editor must be changed through its imperative ref. CDP
+  // Input events can update the rendered DOM while leaving the Slate model
+  // empty, which greys out Send and makes Backspace appear ineffective.
+  let nativeTextInserted = false;
+  if (typeof PROFILE !== 'undefined' && PROFILE &&
+      (PROFILE.id === 'codebuddy-cn' || PROFILE.id === 'codebuddy-intl')) {
+    const nativeInsertExpr = `(async function(){try{
+      var ed=document.querySelector('[data-slate-editor="true"]'), f=ed&&ed[Object.keys(ed).find(function(k){return k.indexOf('__reactFiber')===0;})], ref=null;
+      for(var i=0;f&&i<40;i++,f=f.return){if(f.ref&&f.ref.current&&typeof f.ref.current.replace==='function'&&typeof f.ref.current.prepareBeforeSubmit==='function'){ref=f.ref.current;break;}}
+      if(ref){
+        ref.replace([{type:'text',text:${JSON.stringify(text)}}]);
+        if(typeof ref.flushPendingContentChange==='function') ref.flushPendingContentChange();
+        return {ok:true,length:typeof ref.string==='function'?ref.string().length:${JSON.stringify(text)}.length,mode:'ref'};
+      }
+      var adapter=window.__wbsAdapter;
+      if(adapter&&typeof adapter.requestInsertContentBlocks==='function'){
+        // The renderer callback is intentionally fire-and-forget; awaiting its
+        // return value can hang the CDP evaluation even though the edit landed.
+        try { adapter.requestInsertContentBlocks({contentBlocks:[],clearFirst:true}); } catch (_) {}
+        await new Promise(function(resolve){setTimeout(resolve,120)});
+        try { adapter.requestInsertContentBlocks({contentBlocks:[{type:'text',text:${JSON.stringify(text)}}],promptText:${JSON.stringify(text)},clearFirst:false}); } catch (_) {}
+        await new Promise(function(resolve){setTimeout(resolve,120)});
+        return {ok:true,length:${JSON.stringify(text)}.length,mode:'adapter'};
+      }
+      return {ok:false,error:'未找到 CodeBuddy 编辑器接口'};
+    }catch(e){return {ok:false,error:String(e)}}})()`;
+    const nr = await guardedSend('Runtime.evaluate', { expression: nativeInsertExpr, returnByValue: true, awaitPromise: true });
+    const nv = nr.result && nr.result.value;
+    if (!nv || !nv.ok) throw new Error((nv && nv.error) || 'CodeBuddy 输入框同步失败');
+    nativeTextInserted = true;
+  }
+  if (!nativeTextInserted && clrV.hasContent) {
     // 直接执行 renderer 编辑命令，不经过 macOS 原生菜单快捷键。
     // 旧 Cmd+A 把 Windows 的 65 当作 macOS 原生键码，会误弹“关于 WorkBuddy”并阻塞 CDP。
     await guardedSend('Input.dispatchKeyEvent', { type: 'rawKeyDown', commands: ['selectAll'] });
@@ -7446,7 +8395,7 @@ async function sendStashToComposer(record) {
   // 真实键入文本：逐行 insertText，行间 Shift+Enter 换行（trusted 键盘事件，Slate 生成段落；
   // 不能一次 insertText 整个文本——其中的 \n 不会在 Slate 中变成段落）
   const lines = text.split('\n');
-  for (let li = 0; li < lines.length; li++) {
+  for (let li = 0; !nativeTextInserted && li < lines.length; li++) {
     if (lines[li]) {
       const CHUNK = 4000;
       for (let i = 0; i < lines[li].length; i += CHUNK) {
@@ -7564,6 +8513,21 @@ async function sendStashToComposer(record) {
         var r = button.getBoundingClientRect(), s = getComputedStyle(button);
         return r.width >= 16 && r.height >= 16 && r.bottom > 0 && s.display !== 'none' && s.visibility !== 'hidden';
       }
+      // Native CodeBuddy has square, unlabelled IconButtons. Its submit
+      // callback prepares/flushed Slate content; resolve that exact control.
+      if (document.querySelector('#codebuddy-agents-container')) {
+        var compat = window.__wbsWorkBuddyCompat;
+        var nativeSend = compat && compat.findCodeBuddySendButton(document);
+        if (!nativeSend || !visible(nativeSend)) return { ok: false, retryable: true, error: '未找到 CodeBuddy 发送按钮' };
+        var nativeStyle = getComputedStyle(nativeSend);
+        if (nativeSend.disabled || nativeSend.getAttribute('aria-disabled') === 'true' ||
+            /(?:^|\\s)_disabled_/.test(nativeSend.className) || nativeStyle.pointerEvents === 'none') {
+          return { ok: false, retryable: true, error: '发送按钮禁用（输入内容未被识别）' };
+        }
+        nativeSend.scrollIntoView({ block: 'center', inline: 'center' });
+        var nativeRect = nativeSend.getBoundingClientRect();
+        return { ok: true, x: nativeRect.x + nativeRect.width / 2, y: nativeRect.y + nativeRect.height / 2, selector: 'codebuddy-official-send-button' };
+      }
       var active = document.activeElement;
       var inputBox = active && active.closest ? active.closest('.cr-input-box') : null;
       if (!inputBox) {
@@ -7600,7 +8564,7 @@ async function sendStashToComposer(record) {
           var buttons = document.querySelectorAll('button,[role="button"]'), candidates = [];
           for (var bi = 0; bi < buttons.length; bi++) {
             var b0 = buttons[bi];
-            if (b0.closest && b0.closest('.wbs-root')) continue;
+            if (b0.closest && b0.closest('.wbs-root,.wbs-stash-inline')) continue;
             var br0 = b0.getBoundingClientRect(), cs0 = getComputedStyle(b0);
             var click0 = b0.tagName === 'BUTTON' || b0.getAttribute('role') === 'button';
             var circ0 = /%/.test(cs0.borderRadius || '') || parseFloat(cs0.borderRadius || '0') >= Math.min(br0.width, br0.height) / 2 - 3;
@@ -7645,7 +8609,28 @@ async function sendStashToComposer(record) {
   if (!sv || !sv.ok) throw new Error((sv && sv.error) || '未找到发送按钮');
   if (record.guard) await record.guard();
   if (record.beforeSubmit) await record.beforeSubmit();
-  await cdpMouseClick('automation:sendPhrase', sv.x, sv.y, { textLen: text.length, button: sv });
+  if (sv.selector === 'codebuddy-official-send-button') {
+    // CodeBuddy's official onClick prepares and flushes Slate itself and does
+    // not inspect isTrusted. Dispatch on that control once: CDP mouse ACKs can
+    // stall after the phrase popup closes, and toolbar positions can also move.
+    const submitted = await guardedSend('Runtime.evaluate', { expression: `(function(){/* codebuddy-submit-once */
+      var compat = window.__wbsWorkBuddyCompat;
+      var button = compat && compat.findCodeBuddySendButton(document);
+      if (!button) return { ok: false, error: '未找到 CodeBuddy 发送按钮' };
+      var rect = button.getBoundingClientRect(), style = getComputedStyle(button);
+      if (button.disabled || button.getAttribute('aria-disabled') === 'true' ||
+          /(?:^|\\s)_disabled_/.test(button.className) || style.pointerEvents === 'none' ||
+          style.display === 'none' || style.visibility === 'hidden' || !rect.width || !rect.height) {
+        return { ok: false, error: 'CodeBuddy 发送按钮不可用，未发送' };
+      }
+      button.click();
+      return { ok: true };
+    })()`, returnByValue: true });
+    const value = submitted.result && submitted.result.value;
+    if (!value || !value.ok) throw new Error((value && value.error) || 'CodeBuddy 未确认点击发送');
+  } else {
+    await cdpMouseClick('automation:sendPhrase', sv.x, sv.y, { textLen: text.length, button: sv });
+  }
   const submittedComposerExpr = `(function(){/* composer-after-submit */
     try {
       var editors = document.querySelectorAll('[contenteditable="true"],textarea'), ed = null, bestBottom = -Infinity;
@@ -8375,9 +9360,16 @@ function handleApi(req, res) {
   }
   // 会话模块：POST /api/session-module-set { name, enabled }
   if (req.method === 'POST' && p === '/api/session-module-set') {
-    return readBody(req).then((body) => {
+    return readBody(req).then(async (body) => {
       try {
-        return json(res, 200, { ok: true, ...setSessionSwitch(body.name, !!body.enabled) });
+        if (typeof body.enabled !== 'boolean') return json(res, 400, { ok: false, error: '无效的开关状态' });
+        const state = setSessionSwitch(body.name, body.enabled);
+        if (body.name === 'themeTakeoverEnabled') {
+          themeApplyGeneration++;
+          if (state.themeTakeoverEnabled) await applyThemeByCdp(readSavedThemeId());
+          else await releaseThemeByCdp();
+        }
+        return json(res, 200, { ok: true, ...state });
       } catch (e) {
         return json(res, 500, { ok: false, error: e.message });
       }
@@ -8485,6 +9477,13 @@ function handleApi(req, res) {
   // 「假退出登录」：先退出 WorkBuddy，再删除当前登录文件（备份的 accounts/<uid>.info
   // 仍保留，token 未过期），最后重新打开，让应用回到登录页，方便登录新账号。
   if (req.method === 'POST' && p === '/api/logout') {
+    if (codeBuddyNative) return (async () => {
+      await syncCodeBuddyAuth();
+      if (fs.existsSync(AUTH_FILE)) backupCurrent(DATA_DIR, log);
+      if (!await codeBuddyNative.logout()) throw new Error('CodeBuddy 未确认退出');
+      await syncCodeBuddyAuth();
+      return json(res, 200, {ok:true,quit:false,relaunched:false});
+    })().catch(error => json(res, 500, {ok:false,error:error.message}));
     return (async () => {
       let quit = false;
       let relaunched = false;
@@ -8523,7 +9522,7 @@ function handleApi(req, res) {
   if (req.method === 'POST' && p === '/api/oauth/start') {
     return (async () => {
       try {
-        const oauthPlatform = PROFILE.id === 'workbuddy-ai' ? 'workbuddy-ai' : 'workbuddy';
+        const oauthPlatform = PROFILE.oauthPlatform || (PROFILE.id === 'workbuddy-ai' ? 'workbuddy-ai' : 'workbuddy');
         const resp = await httpJson(
           `${WB_API_ENDPOINT}${WB_API_PREFIX}/auth/state?platform=${oauthPlatform}`,
           'POST',
@@ -8677,6 +9676,13 @@ function handleApi(req, res) {
     });
   }
 
+  if (req.method === 'POST' && p === '/api/accounts/note') {
+    return readBody(req).then((body) => {
+      try { return json(res, 200, { ok: true, account: setAccountNote(DATA_DIR, body) }); }
+      catch (error) { return json(res, 400, { ok: false, error: error.message }); }
+    });
+  }
+
   if (req.method === 'POST' && p === '/api/accounts/order') {
     return readBody(req).then((body) => {
       try { return json(res, 200, { ok: true, accountOrder: setAccountOrder(DATA_DIR, body) }); }
@@ -8708,6 +9714,38 @@ function handleApi(req, res) {
     });
   }
 
+  // Renderer reports only the structured model-rate-limit fields. Never accept
+  // raw provider errors, prompts, response bodies, or credentials here.
+  if (req.method === 'POST' && p === '/api/model-rate-limit') {
+    return readBody(req).then(async (body) => {
+      try {
+        const uid = String(body && body.uid || '').trim();
+        const modelId = String(body && body.modelId || '').trim();
+        if (!/^[A-Za-z0-9_-]{1,128}$/.test(uid)) return json(res, 400, { ok: false, error: 'uid 格式无效' });
+        if (!/^[^\x00-\x1F\x7F]{1,160}$/.test(modelId)) return json(res, 400, { ok: false, error: '模型 ID 无效' });
+        const account = listAccounts(DATA_DIR).find((item) => String(item.uid) === uid);
+        if (!account) return json(res, 404, { ok: false, error: '账号不存在' });
+        const reasonCode = body && body.reasonCode === null ? null : Number(body && body.reasonCode);
+        if (reasonCode !== 6004) return json(res, 400, { ok: false, error: '仅记录模型限流 code 6004' });
+        const resetAt = body && body.resetAt === null ? null : Number(body && body.resetAt);
+        if (resetAt !== null && (!Number.isSafeInteger(resetAt) || resetAt < Date.now() - 86400000 || resetAt > Date.now() + 90 * 86400000)) {
+          return json(res, 400, { ok: false, error: '解封时间无效' });
+        }
+        await CREDIT_USAGE_STORE.saveModelRateLimit({
+          uid, modelId,
+          modelName: String(body && body.modelName || '').slice(0, 256),
+          resetAt,
+          observedAt: Date.now(),
+          source: String(body && body.source || 'renderer-error').slice(0, 80),
+          reasonCode,
+        });
+        return json(res, 200, { ok: true });
+      } catch (error) {
+        return json(res, 400, { ok: false, error: error.message });
+      }
+    });
+  }
+
   if (req.method === 'GET' && p === '/api/accounts') {
     const accounts = listAccounts(DATA_DIR);
     const checkinAutomationEnabled = readAutomations(DATA_DIR).some(task => task.enabled && stepsContainCheckin(task.steps));
@@ -8729,17 +9767,24 @@ function handleApi(req, res) {
             activityStreak: growthStreakCache.peek(a.uid),
           });
         });
-        return listDailyUsage(enriched, today)
+        return CREDIT_USAGE_STORE.listModelRateLimits(accounts.map((a) => a.uid), Date.now()).catch((error) => {
+            log('[model-rate-limit] 读取 SQLite 标记失败: ' + error.message);
+            return {};
+          })
+        .then((modelRateLimits) => {
+          const withLimits = enriched.map((account) => Object.assign({}, account, { modelRateLimits: modelRateLimits[account.uid] || [] }));
+          return listDailyUsage(withLimits, today)
           .then((summaries) => {
-            const withUsage = enriched.map((account) => summaries[account.uid]
+            const withUsage = withLimits.map((account) => summaries[account.uid]
               ? Object.assign({}, account, { todayUsage: summaries[account.uid] })
               : account);
             return json(res, 200, { ok: true, checkinAutomationEnabled, current: currentAccount(), primaryUid: primaryAccountStore.get(), accountOrder: getAccountOrder(DATA_DIR), accounts: withUsage });
           })
           .catch((error) => {
             log('[credits-usage] 读取本地今日用量失败: ' + error.message);
-            return json(res, 200, { ok: true, checkinAutomationEnabled, current: currentAccount(), primaryUid: primaryAccountStore.get(), accountOrder: getAccountOrder(DATA_DIR), accounts: enriched });
+            return json(res, 200, { ok: true, checkinAutomationEnabled, current: currentAccount(), primaryUid: primaryAccountStore.get(), accountOrder: getAccountOrder(DATA_DIR), accounts: withLimits });
           });
+        });
       });
   }
 
@@ -8833,14 +9878,15 @@ function handleApi(req, res) {
   }
 
   if (req.method === 'GET' && p === '/api/token-stats') {
-    if (PROFILE.kind !== 'workbuddy') return json(res, 400, { ok: false, error: '当前客户端不支持 Token 统计' });
-    if (url.searchParams.get('cacheStatus') === '1') return json(res, 200, { ok: true, cacheReady: tokenStatsCacheReady(PROFILE.dataRoot) });
+
+    if (url.searchParams.get('cacheStatus') === '1') return json(res, 200, { ok: true, cacheReady: tokenStatsCacheReady(PROFILE.dataRoot, codeBuddyFiles ? {cacheFile:path.join(DATA_DIR,'token-stats-cache.json')} : {}) });
     const days = Math.max(1, Math.min(90, Number(url.searchParams.get('days') || 7)));
     const accounts = listAccounts(DATA_DIR);
     return sqliteQuery('SELECT id, user_id FROM sessions WHERE deleted_at IS NULL;')
       .then((rows) => {
         const sessionAccounts = Object.fromEntries(rows.map((row) => [String(row.id || ''), String(row.user_id || '')]).filter((item) => item[0] && item[1]));
         const stats = scanTokenStatsCached(PROFILE.dataRoot, {
+          ...(codeBuddyFiles ? {...codeBuddyFiles.tokenOptions(rows.map(row=>row.id)),cacheFile:path.join(DATA_DIR,'token-stats-cache.json')} : {}),
           days,
           account: url.searchParams.get('account') || '',
           model: url.searchParams.get('model') || '',
@@ -8857,8 +9903,7 @@ function handleApi(req, res) {
   }
 
   if (req.method === 'GET' && p === '/api/credit-stats') {
-    if (PROFILE.kind !== 'workbuddy') return json(res, 400, { ok: false, error: '当前客户端不支持积分历史查询' });
-    try {
+        try {
       const range = historyRange(url.searchParams.get('days') || 7);
       const accounts = listAccounts(DATA_DIR);
       const uid = url.searchParams.get('account') || '';
@@ -8873,8 +9918,7 @@ function handleApi(req, res) {
     return json(res, 200, { ok: true, job: creditHistorySync.status() });
   }
   if (req.method === 'POST' && p === '/api/credit-stats') {
-    if (PROFILE.kind !== 'workbuddy') return json(res, 400, { ok: false, error: '当前客户端不支持积分历史查询' });
-    return readBody(req).then((body) => {
+        return readBody(req).then((body) => {
       const range = historyRange(body && body.days !== undefined ? body.days : 7);
       const requested = body && body.uids;
       const accounts = listAccounts(DATA_DIR);
@@ -8932,7 +9976,7 @@ function handleApi(req, res) {
     return readBody(req).then(async (body) => {
       const uid = String(body && body.uid || '').trim();
       if (!/^[A-Za-z0-9_-]{1,128}$/.test(uid)) return json(res, 400, { ok: false, error: 'uid 格式无效' });
-      if (PROFILE.id !== 'workbuddy-cn') return json(res, 400, { ok: false, error: '当前客户端不支持成长活跃查询' });
+      if (PROFILE.capabilities.growthDaily !== true) return json(res, 400, { ok: false, error: '当前客户端不支持成长活跃查询' });
       if (!fs.existsSync(accountBackupFile(uid))) return json(res, 404, { ok: false, error: '账号备份不存在' });
       const activityStreak = await growthStreakCache.get(uid);
       return json(res, 200, { ok: true, uid, activityStreak });
@@ -9125,9 +10169,7 @@ function handleApi(req, res) {
   // 主题列表（内置 + 用户自定义）
   if (req.method === 'GET' && p === '/api/themes') {
     try {
-      const current = fs.existsSync(path.join(DATA_DIR, 'current-theme.json'))
-        ? JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'current-theme.json'), 'utf8')).id
-        : 'default';
+      const current = readSavedThemeId();
       return json(res, 200, { ok: true, themes: listThemes(), current });
     } catch (e) {
       return json(res, 500, { ok: false, error: e.message });
@@ -9316,6 +10358,22 @@ function handleApi(req, res) {
   }
   if (req.method === 'POST' && p === '/api/sleep-now') {
     return sleepNow() ? json(res, 200, { ok: true }) : json(res, 500, { ok: false, error: '立即休眠失败' });
+  }
+
+  // 会话同步回滚备份：只返回占用与状态摘要，不返回备份内容。
+  // Keep this expression self-contained because old renderer test harnesses
+  // evaluate only handleApi without the daemon module's top-level imports.
+  const syncBackupRoot = String(DATA_DIR || '') + (String(DATA_DIR || '').endsWith('/') || String(DATA_DIR || '').endsWith('\\') ? '' : '/') + 'session-sync-backups';
+  if (req.method === 'GET' && p === '/api/sessions/sync-backups') {
+    return json(res, 200, { ok: true, backups: sessionSync.inspectSyncBackups(syncBackupRoot) });
+  }
+  if (req.method === 'POST' && p === '/api/sessions/sync-backups/cleanup') {
+    return readBody(req).then((body) => {
+      const requestedDays = Number(body && body.maxAgeDays);
+      const maxAgeDays = Number.isFinite(requestedDays) ? Math.min(365, Math.max(1, requestedDays)) : 30;
+      const result = sessionSync.pruneSyncBackups(syncBackupRoot, { maxAgeMs: maxAgeDays * 24 * 60 * 60 * 1000 });
+      return json(res, 200, { ok: true, removed: result.removed, retainedRecovery: result.retainedRecovery, maxAgeDays, backups: sessionSync.inspectSyncBackups(syncBackupRoot) });
+    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
   }
 
   // 会话列表：GET /api/sessions?uid=<账号uid>&range=today|7d|30d|all（uid 缺省=当前账号；uid=空=全部账号）
@@ -9637,11 +10695,41 @@ function handleApi(req, res) {
     const currentUid = String((currentAccount() || {}).uid || '').trim();
     return json(res, 200, { ok: true, job: publicAutoCopyJob(activeAutoCopyJob(currentUid)) });
   }
-  // Stream the completed encrypted archive; clean up even if the download disconnects.
+  if (req.method === 'GET' && p === '/api/sessions/export') {
+    const id = url.searchParams.get('id');
+    const job = sessionExportJobs.get(id);
+    if (id && !job) return json(res, 404, { ok: false, code: 'EXPORT_JOB_NOT_FOUND', error: '导出任务不存在' });
+    return json(res, 200, { ok: true, job });
+  }
+  if (req.method === 'POST' && p === '/api/sessions/export/cancel') {
+    return readBody(req).then(body => {
+      const job = body && typeof body.id === 'string' && sessionExportJobs.cancel(body.id);
+      return json(res, job ? 200 : 404, job ? { ok: true, job } : { ok: false, error: '导出任务不存在' });
+    });
+  }
+  if (req.method === 'POST' && p === '/api/sessions/export/open') {
+    return readBody(req).then(async body => {
+      const job = body && typeof body.id === 'string' && sessionExportJobs.get(body.id);
+      if (!job || job.status !== 'completed' || !job.file) return json(res, 400, { ok: false, error: '导出尚未完成' });
+      // The renderer supplies a job ID, never an arbitrary filesystem path.
+      const command = IS_WIN ? 'explorer.exe' : IS_LINUX ? 'xdg-open' : '/usr/bin/open';
+      const result = await runCommand(command, [path.dirname(job.file)]);
+      if (result.error || (result.code !== 0 && !IS_WIN)) return json(res, 500, { ok: false, error: '无法打开导出目录' });
+      return json(res, 200, { ok: true });
+    });
+  }
+  // Older clients can still stream the completed archive. New panels request
+  // a background job, which publishes directly to Downloads without a browser Blob.
   if (req.method === 'POST' && p === '/api/sessions/export') {
     return readBody(req).then(async (body) => {
       let result;
       try {
+        if (body && body.background === true) {
+          const ids = normalizeSessionIdBatch(body.ids);
+          if (!ids.length) throw new Error('未选择会话');
+          const job = sessionExportJobs.start(ids, body.password);
+          return json(res, 202, { ok: true, job });
+        }
         result = await exportSessions(body && body.ids, body && body.password);
         if (res.destroyed) return;
         const headers = {
@@ -9706,7 +10794,7 @@ function handleApi(req, res) {
       try {
         const rows = await sqliteQuery(
           'SELECT ' + SESSION_COPY_COLUMNS.join(',') +
-            ' FROM sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1;',
+            " FROM sessions WHERE id = ? AND (user_id = ? OR user_id = '') AND deleted_at IS NULL LIMIT 1;",
           [id, uid]
         );
         if (!rows.length) return json(res, 404, { ok: false, error: '当前账号下没有该会话' });
@@ -9745,6 +10833,13 @@ function handleApi(req, res) {
           else if (result.status === 'skipped') skipped++;
           else copied++;
         }
+        // [CodeBuddy 会话同步] 同步到当前账号时刷新 IDE workbench：扩展宿主的
+        // indexCache 不因外部写 index.json 失效，侧边栏要等 TTL/重启才显示（详见
+        // reloadIdeWorkbenchWindows 注释）。同步到其他账号无需刷新——切号时
+        // session-change 会清缓存。
+        if (copied > 0 && targetUid === String((currentAccount() || {}).uid || '')) {
+          reloadIdeWorkbenchWindows('sessions-copy');
+        }
         return json(res, 200, { ok: true, copied, skipped, conflicts, targetUid, warning });
       } catch (e) {
         return json(res, 500, { ok: false, error: e.message });
@@ -9780,6 +10875,18 @@ function handleApi(req, res) {
             log(`[sessions-auto-copy] 迁移规则 ${row.id} 失败: ${e.message}`);
           }
         }
+        // The migration changes ownership in SQLite without going through
+        // WorkBuddy's collection store. Refresh the visible account's list so
+        // a migrated history row is hydrated by the official controller.
+        await refreshWorkBuddySessionList(String((currentAccount() || {}).uid || '').trim(), 'sessions-migrate');
+        // [CodeBuddy 会话同步] 迁入或迁出当前账号都刷新 IDE workbench：扩展宿主的
+        // indexCache 不因外部写 index.json 失效（详见 reloadIdeWorkbenchWindows 注释），
+        // 迁入需让新会话出现，迁出需让旧条目消失。
+        const migrateCurrentUid = String((currentAccount() || {}).uid || '');
+        if (before.length && (targetUid === migrateCurrentUid
+            || before.some((row) => String(row.user_id || '') === migrateCurrentUid))) {
+          reloadIdeWorkbenchWindows('sessions-migrate');
+        }
         return json(res, 200, { ok: true, moved: before.length, requested: ids.length, targetUid, rulesMoved });
       } catch (e) {
         return json(res, 500, { ok: false, error: e.message });
@@ -9809,7 +10916,8 @@ function handleApi(req, res) {
         // 1) 先完成可重试的文件与规则清理；失败时保留 DB 记录作为重试锚点。
         const wbHome = PROFILE.dataRoot;
         let filesRemoved = 0;
-        for (const id of matchedIds) filesRemoved += deleteSessionFiles(wbHome, id);
+        if (codeBuddyFiles) await assertSessionSyncIdle(matchedIds);
+        else for (const id of matchedIds) filesRemoved += deleteSessionFiles(wbHome, id);
         let rulesRemoved = 0;
         for (const row of matchedRows) {
           try {
@@ -9821,10 +10929,12 @@ function handleApi(req, res) {
         }
         // 2) 最后真实删除 DB 记录（非软删）。若此步失败，重复请求可安全重试。
         if (matchedIds.length) {
-          await sqliteRun(
+          const removeRecords = () => sqliteRun(
             "DELETE FROM sessions WHERE id IN (" + sqlPlaceholders(matchedIds) + ");",
             matchedIds
           );
+          if (codeBuddyFiles) filesRemoved = await codeBuddyFiles.deleteSessions(matchedIds, removeRecords);
+          else await removeRecords();
         }
         const cascaded = matchedIds.filter((id) => !requestedSet.has(String(id))).length;
         log(`[sessions-delete] 已真实删除 ${matchedIds.length} 个会话（DB + ${filesRemoved} 项文件，级联副本 ${cascaded}）`);
@@ -9893,7 +11003,7 @@ function handleApi(req, res) {
         r.on('end', () => {
           try {
             const list = JSON.parse(d);
-            const page = list.find(isWorkBuddyCdpTarget);
+            const page = selectPageTarget(list, PROFILE);
             const id = page && page.id;
             if (!id) return resolve(json(res, 500, { ok: false, error: '未找到 WorkBuddy 页面 target' }));
             if (!wsLib) return resolve(json(res, 500, { ok: false, error: 'ws 代理库未加载，无法打开 DevTools' }));
@@ -9914,6 +11024,7 @@ function handleApi(req, res) {
       if (id !== 'default' && !getTheme(id)) return json(res, 404, { ok: false, error: '主题不存在: ' + id });
       return applyThemeByCdp(id)
         .then((info) => {
+          if (info.cancelled) return json(res, 409, { ok: false, error: '主题切换已被后续操作取消' });
           try {
             fs.writeFileSync(path.join(DATA_DIR, 'current-theme.json'), JSON.stringify({ id, at: new Date().toISOString() }, null, 2));
           } catch (error) {
@@ -10376,8 +11487,9 @@ function handleApi(req, res) {
             currentConversationRow = { ...ownerRows[0], id: currentConversationId };
           }
         }
-        const acct = switchTo(DATA_DIR, uid, log);
-        const hint = '登录文件已切换，请重启 WorkBuddy 使新账号生效';
+        if (sourceUid !== uid) await preserveAccountSwitchTheme(uid);
+        const acct = await switchAccountForProfile(uid);
+        const hint = acct.nativeSwitched ? '原生登录态已切换，无需重启客户端' : '登录文件已切换，请刷新窗口使新账号生效';
         let reloaded = false;
         if (body.reload) {
           try {
@@ -10739,6 +11851,10 @@ process.on('unhandledRejection', (reason) => {
 
 ensureDirs(DATA_DIR, log);
 if (!acquireDaemonLock()) process.exit(0);
+const sessionBackupCleanup = sessionSync.pruneSyncBackups(path.join(DATA_DIR, 'session-sync-backups'));
+if (sessionBackupCleanup.removed || sessionBackupCleanup.retainedRecovery) {
+  log(`[session-sync-backups] 启动清理 ${sessionBackupCleanup.removed} 个无用备份，保留 ${sessionBackupCleanup.retainedRecovery} 个 recovery-needed 备份`);
+}
 ensureAgentBridge(DATA_DIR, { profileId: PROFILE.id });
 const automationAgentInboxTimer = setInterval(() => {
   const imported = importAgentInbox(DATA_DIR, { profileId: PROFILE.id });
@@ -10762,22 +11878,28 @@ log(`登录信息文件: ${currentAuthFile() || '(未唯一确认)'}`);
 log(`备份目录: ${DATA_DIR}`);
 updateDebug('daemon-start', { authFile: currentAuthFile(), dataDir: DATA_DIR, appPath: IS_WIN ? WORKDADDY_DIR_WIN : macWorkDaddyAppPath(), apiPort: UI_PORT_BASE });
 
-for (const preset of ['close-buddy-popups.json', ...(PROFILE.capabilities.accounts ? ['keep-accounts-active.json'] : []), ...(PROFILE.id === 'workbuddy-cn' ? ['buddy-travel.json', 'daily-account-checkin.json'] : [])]) {
-  try {
-    const result = installBuiltinTask(DATA_DIR, path.join(__dirname, 'builtin/automations', preset));
-    if (result && result.status === 'upgraded') log(`[automation] 内置任务已升级: ${preset} (revision ${result.revision})`);
+if (PROFILE.capabilities.builtinAutomations === false) {
+  removeBuiltinTasks(DATA_DIR);
+} else {
+  for (const preset of ['close-buddy-popups.json', ...(PROFILE.capabilities.accounts ? ['keep-accounts-active.json'] : []), ...(PROFILE.id === 'workbuddy-cn' || PROFILE.id === 'codebuddy-cn' ? ['buddy-travel.json', 'daily-account-checkin.json'] : [])]) {
+    try {
+      const result = installBuiltinTask(DATA_DIR, path.join(__dirname, 'builtin/automations', preset), PROFILE);
+      if (result && result.status === 'upgraded') log(`[automation] 内置任务已升级: ${preset} (revision ${result.revision})`);
+    }
+    catch (_) { log('[automation] 初始化内置任务失败: ' + preset); }
   }
-  catch (_) { log('[automation] 初始化内置任务失败: ' + preset); }
 }
 restoreSleepMode();
 startServer();
 cdpLoop();
+if (codeBuddyNative) setInterval(() => { if (!accountSwitchInProgress) scheduleBackup('native-auth'); }, 15000);
 // Migrate legacy target row baselines off the switch hot path. This is a
 // metadata-only repair and does not read any session payload files.
 setTimeout(() => { migrateAutoCopyTargetRevisionBaselines().catch(() => {}); }, 0);
 // All automatic check-in entry points are owned by the visible automation task.
 const tickAutomationSchedules = createScheduleTicker(DATA_DIR);
 function runAutomationSchedules() {
+  if (PROFILE.capabilities.automations === false) return;
   tickAutomationSchedules(readAutomations(DATA_DIR), startAutomationRun,
     (id) => Array.from(automationRuns.values()).some((run) => run.taskId === id && run.status === 'running'));
 }

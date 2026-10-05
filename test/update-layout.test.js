@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const childProcess = require('node:child_process');
 const fs = require('node:fs');
+const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -21,9 +22,7 @@ test('Windows updater launches the installed scripts launcher', () => {
 test('Windows updater prefers profile Setup.exe and keeps ZIP compatibility', () => {
   const daemon = read('daemon.js');
   const update = read('apply-update.ps1');
-  assert.match(daemon, /profileSetup/);
-  assert.match(daemon, /profileZip/);
-  assert.ok(daemon.indexOf('profileSetup.test') < daemon.indexOf('profileZip.test'), 'Setup.exe must win when both assets exist');
+  assert.ok(daemon.indexOf("matches(a, 'Setup-") < daemon.indexOf('-win64'), 'Setup.exe must win when both assets exist');
   assert.match(daemon, /assetName.*\.exe/);
   assert.match(daemon, /packageExt/);
   assert.match(update, /Alias\('SrcZip'\)/);
@@ -160,7 +159,7 @@ test('account switching refreshes WorkBuddy after replacing auth without restart
   const routeStart = script.indexOf("if (req.method === 'POST' && p === '/api/switch')");
   assert.notEqual(routeStart, -1);
   const route = script.slice(routeStart, routeStart + 5200);
-  const copy = route.indexOf('switchTo(DATA_DIR, uid, log)');
+  const copy = route.indexOf('await switchAccountForProfile(uid)');
   assert.notEqual(copy, -1);
   assert.match(route, /await reloadWorkBuddyPage\(\{ waitForInjection: false \}\)/);
   assert.doesNotMatch(route, /await quitWorkBuddy\(\)/);
@@ -187,7 +186,7 @@ test('account switching carries the active conversation and opens its copied tar
   assert.match(inject, /currentConversationId: acSwitchConversationId\(\)/);
   assert.match(inject, /function acSwitchConversationId()/);
   assert.match(inject, /openCopiedSession/);
-  assert.match(compat, /function findConversationActivationApi\(doc\)/);
+  assert.match(compat, /function findConversationActivationApi\(doc, options\)/);
   assert.match(compat, /setCurrentConversation/);
   assert.match(compat, /sdkNavigateKind/);
   assert.match(compat, /adapter\.emit\('jump-to-conversation'/);
@@ -238,6 +237,7 @@ test('copied-session activation trusts the official handler even when projection
     console: { log: (...args) => logs.push(args.join(' ')) },
     setBuildTimeout: setTimeout,
     acActiveConversationId: () => activeId,
+    PROFILE_ID: 'workbuddy-cn',
     WBS_COMPAT: {
       findConversationActivationApi() {
         return {
@@ -278,6 +278,7 @@ test('copied-session activation retries an unverified official dispatch', async 
     console: { log: (...args) => logs.push(args.join(' ')) },
     setBuildTimeout: setTimeout,
     acActiveConversationId: () => activeId,
+    PROFILE_ID: 'workbuddy-cn',
     WBS_COMPAT: {
       findConversationActivationApi() {
         return {
@@ -338,7 +339,7 @@ test('WorkDaddy-triggered reload injects on the new main execution context befor
 
   const switchStart = script.indexOf("if (req.method === 'POST' && p === '/api/switch')");
   const switchRoute = script.slice(switchStart, switchStart + 9000);
-  const switchWrite = switchRoute.indexOf('switchTo(DATA_DIR, uid, log)');
+  const switchWrite = switchRoute.indexOf('await switchAccountForProfile(uid)');
   assert.notEqual(switchWrite, -1);
   assert.doesNotMatch(switchRoute.slice(0, switchWrite), /buildAutoCopyPlan\(/, 'session planning must not delay auth replacement and renderer reload');
   assert.ok(switchRoute.indexOf('await reloadWorkBuddyPage({ waitForInjection: false })') < switchRoute.indexOf('startAutoCopyJob('), 'renderer reload must precede the background auto-copy queue');
@@ -427,6 +428,23 @@ test('Windows launcher keeps local port probing and profile CDP candidates defin
   assert.match(launcher, /'workbuddy-cn': \[9222/);
   assert.match(launcher, /'workbuddy-ai': \[9223/);
   assert.match(launcher, /isTargetForProfile\(target, PROFILE\)/);
+});
+
+test('Windows launcher has an OS-assigned CDP fallback when profile ports are unavailable', async () => {
+  const launcherSource = read('win-launcher.js');
+  assert.match(launcherSource, /function reserveEphemeralCdpPort\(\)/);
+  assert.match(launcherSource, /server\.listen\(\{ host: HOST, port: 0 \}/);
+  assert.match(launcherSource, /const ephemeralPort = await reserveEphemeralCdpPort\(\)/);
+  assert.match(launcherSource, /CDP_PORT_DYNAMIC/);
+
+  const launcher = require(path.join(repoRoot, 'scripts', 'win-launcher.js'));
+  const port = await launcher.reserveEphemeralCdpPort();
+  assert.ok(Number.isInteger(port) && port >= 1024 && port <= 65535);
+  await new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen({ host: '127.0.0.1', port }, () => server.close((error) => error ? reject(error) : resolve()));
+  });
 });
 
 test('Windows launcher propagates the WorkBuddy AI UI port to child processes', { skip: process.platform !== 'win32' }, () => {
@@ -525,7 +543,7 @@ test('session module read remains usable when first-run seed persistence fails',
   assert.match(reader, /try\s*\{[\s\S]*writeWorkbuddySettings\(s\)/);
   assert.match(reader, /catch \(error\)/);
   assert.match(reader, /session-seed-persist/);
-  assert.match(reader, /return sessBuild\(st, phrases\)/);
+  assert.match(reader, /const result = sessBuild\(st, phrases\)/);
 });
 
 test('macOS updater validates a cached/downloaded DMG before mounting it', () => {
@@ -548,13 +566,16 @@ test('Windows launcher scopes process discovery to the active profile and record
   assert.match(launcher, /processDiagnostics/);
 });
 
-test('release scripts package only WorkDaddy and WorkDaddy AI', () => {
+test('release scripts package all four independently branded profiles', () => {
   const win = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-win-zip.sh'), 'utf8');
   const mac = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-mac-dmg.sh'), 'utf8');
   const installer = read('install-win.ps1');
   for (const script of [win, mac]) {
     assert.match(script, /for profile in workbuddy-cn workbuddy-ai/);
-    assert.doesNotMatch(script, /codebuddy-cn|codebuddy-intl/);
+    assert.match(script, /codebuddy-cn/);
+    assert.match(script, /codebuddy-intl/);
+    assert.match(script, /CodeDaddy-CN/);
+    assert.match(script, /CodeDaddy/);
   }
   assert.match(win, /WorkDaddy AI\.lnk|PACKAGE_NAME="WorkDaddy AI"/);
   assert.match(win, /OUT="release\/windows\/WorkDaddy/);
@@ -818,7 +839,7 @@ test('Windows Setup waits for WorkBuddy and stops only a native-verified profile
   assert.match(installer, /ResultCode <> 10/);
   assert.match(installer, /ResultCode = 11/);
   assert.match(installer, /runtime\\node\\\*/);
-  assert.match(installer, /无法安全停止 WorkDaddy 后台进程/);
+  assert.match(installer, /无法安全停止 ' \+ ProductName \+ ' 后台进程/);
   assert.match(installer, /function ConfirmElevatedInstall/);
   assert.match(installer, /if IsAdmin and not ConfirmElevatedInstall/);
   assert.match(installer, /MB_YESNO/);
@@ -831,8 +852,8 @@ test('Windows Setup waits for WorkBuddy and stops only a native-verified profile
   assert.match(installer, /function ShouldAutoLaunch[\s\S]*Result := not IsAdmin/);
   assert.match(installer, /普通安装器不会跨权限强行结束/);
   assert.match(installer, /按 Ctrl\+Shift\+Esc 打开任务管理器/);
-  assert.match(installer, /旧版 WorkDaddy 的状态文件与实际程序不一致/);
-  assert.match(installer, /不要手动删除 WorkDaddy 数据目录/);
+  assert.match(installer, /旧版 ' \+ ProductName \+ ' 的状态文件与实际程序不一致/);
+  assert.match(installer, /不要手动删除 ' \+ ProductName \+ ' 数据目录/);
   assert.doesNotMatch(installer, /旧版 WorkDaddy 正以管理员权限运行/);
   assert.doesNotMatch(installer, /prepare-win-install|windows-process-boundary|PowerShell/i);
 });
@@ -958,7 +979,7 @@ test('account cards keep the compact three-row layout', () => {
   assert.doesNotMatch(script, /data-tip="' \+ attrTip \+ '" title=/);
   assert.match(script, /creditOpacity\(row\.days\)/);
   assert.match(script, /creditOpacity\(segment\.expiresAt/);
-  assert.match(script, /\.wbs-credit-segment,\.wbs-credit-summary-fill\{background:rgba\(var\(--wbs-primary-rgb,34,197,94\),var\(--wbs-credit-alpha,1\)\)/);
+  assert.match(script, /\.wbs-credit-segment,\.wbs-credit-summary-fill\{background:color-mix\(in srgb,var\(--wbs-credit-theme-color,var\(--wbs-primary\)\) calc\(var\(--wbs-credit-alpha,1\) \* 100%\),transparent\)/);
   ['dark', 'cyber-purple', 'nebula'].forEach((themeId) => {
     assert.match(script, new RegExp('html\\[data-wbs-theme-id="' + themeId + '"\\][\\s\\S]*--wbs-primary-rgb:127,119,221'));
   });
@@ -966,6 +987,22 @@ test('account cards keep the compact three-row layout', () => {
   assert.match(script, /今日签到/);
   assert.match(script, /function accountStatusTagsHtml\(a\)/);
   assert.match(script, /function checkinBadgeHtml\(a\)/);
+  assert.match(script, /wbs-model-rate-limit wbs-ck wbs-checkin-tag ok/);
+  assert.match(script, /function setupModelRateLimitPopover\(\)/);
+  assert.match(script, /\.wbs-status-popover\.is-rate-limit/);
+  assert.match(script, /\.wbs-status-popover\.is-rate-limit\{width:500px/);
+  assert.match(script, /\.wbs-status-popover\.is-rate-limit-summary\{width:360px/);
+  assert.match(script, /data-act="model-rate-limit-summary"/);
+  assert.match(script, /function modelRateLimitSummaryPopoverHtml\(accounts\)/);
+  assert.match(script, /showStatusPopover\(summaryButton, modelRateLimitSummaryPopoverHtml\(state\.accounts\)/);
+  assert.match(script, /placement === 'below'/);
+  assert.match(script, /\.wbs-model-rate-limit-summary-row/);
+  assert.match(script, /\.wbs-model-rate-limit-detail b\{white-space:nowrap/);
+  assert.match(script, /wbs-model-rate-limit-model/);
+  assert.match(script, /wbs-model-rate-limit-reset/);
+  assert.doesNotMatch(script, /限流期间可切换其他模型/);
+  assert.match(script, /function fmtDateTimeSeconds\(ts\)/);
+  assert.doesNotMatch(script, /wbs-model-rate-limit[^']*cursor:help/);
   assert.match(script, /badge \+ dailyRingsHtml\(a\) \+ checkinBadge/);
   assert.match(script, /if \(!usage \|\| usage\.synced !== true\) return '';/);
   assert.match(script, /wbs-usage-tag/);
@@ -995,7 +1032,8 @@ test('account cards sort by credit expiry without pinning the current account', 
 test('quick-phrase layering does not reposition WorkBuddy native chat toolbar', () => {
   const script = read('inject.js');
   assert.match(script, /\.wbs-explore-inline\.wbs-stash-inline-inline\{position:relative;z-index:99999\}/);
-  assert.match(script, /\.wbs-explore-pop\{[^}]*z-index:2147483647/);
+  assert.match(script, /\.wbs-explore-pop\{position:fixed;[^}]*z-index:22/);
+  assert.match(script, /mountPersistentOverlay\(popup\)/);
   assert.match(script, /html\[data-wbs-theme-id="nebula"\] \.wbs-explore-card\{[^}]*background:color-mix\(in srgb,var\(--wb-bg-popover/);
   assert.match(script, /html\[data-wbs-theme-id="nebula"\] \.wbs-explore-tip\{[^}]*background:color-mix\(in srgb,var\(--wb-bg-popover/);
   assert.doesNotMatch(script, /_chatMessageBottomToolbarWrapper_\}\{position:relative;z-index:68/);

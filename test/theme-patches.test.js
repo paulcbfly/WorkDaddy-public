@@ -59,3 +59,45 @@ test('nebula removes backgrounds from the template switcher and code copy toolti
   assert.match(patch.css, /background:transparent !important/);
   assert.match(patch.css, /box-shadow:none !important/);
 });
+
+test('nebula removes the send SVG disc without hiding the arrow or changing other icons', () => {
+  const patch = patches.find(item => item.id === 'patch-105');
+  assert.ok(patch);
+  assert.equal(patch.themeId, 'nebula');
+  assert.match(patch.css, /\.cr-send-button__icon svg\[viewBox="0 0 32 32"\]>path\[d\^="M16 32C24\.8366"\]/);
+  assert.match(patch.css, /d:path\("M16 19\.2104/);
+  assert.match(patch.css, /fill:var\(--wb-button-primary-fg\)/);
+  assert.doesNotMatch(patch.css, /display:none|visibility:hidden|opacity:0|fill:transparent/);
+});
+
+test('legacy tooltip backgrounds exclude inline anchors and copy/send trigger wrappers', () => {
+  const css = patches.find(p => p.id === 'patch-15').css;
+  const rule = css.split('}').find(rule => rule.includes('[class*="tooltip"]'));
+  for (const cls of ['cr-clickable-path-tooltip-anchor', 'cr-code-block__copy-tooltip', 'cr-send-button__tooltip-wrapper']) {
+    assert.ok(rule.includes(':not(.' + cls + ')'), cls + ' is a trigger, not a tooltip surface');
+  }
+  assert.match(rule, /background:var\(--wb-bg-popover\)/, 'real tooltips retain a readable surface');
+});
+
+test('nebula file links and code copy controls use transparent backgrounds in all interaction states', () => {
+  const patch = patches.find(p => p.id === 'patch-106');
+  assert.ok(patch);
+  assert.equal(patch.themeId, 'nebula');
+  for (const cls of ['cr-clickable-path-tooltip-anchor', 'cr-clickable-path', 'cr-code-block__copy-tooltip', 'cr-code-block__copy-button']) {
+    assert.ok(patch.css.includes('.' + cls));
+  }
+  assert.match(patch.css, /background:transparent !important/);
+  assert.doesNotMatch(patch.css, /:hover|:focus|:active/, 'unconditional important override covers native hover and active fills');
+});
+
+test('generic dark popup text repair excludes the WorkDaddy status popover', () => {
+  const patch = patches.find(item => item.id === 'patch-44');
+  const selectors = patch.css.slice(0, patch.css.indexOf('{')).split(',');
+  assert.equal(selectors.length, 3);
+  for (const selector of selectors) {
+    assert.match(selector, /\*:not\(:where\(\.wbs-status-popover \*\)\)$/,
+      'official popup text repair must not override themed WorkDaddy buttons and reward labels');
+  }
+  assert.match(patch.css, /color:var\(--wb-color-text-primary\) !important/,
+    'official tooltip/dropdown text still needs the dark-theme repair');
+});

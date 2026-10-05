@@ -16,10 +16,34 @@ test('scans usage metadata without reading message semantics into the result', (
     '{broken',
   ].join('\n'));
   const result = scanTokenStats(root, { now: Date.parse('2026-09-11T10:00:00Z'), days: 7 });
-  assert.deepEqual(result.totals, { input: 10, output: 4, cacheRead: 2, cacheWrite: 0, calls: 1 });
+  assert.deepEqual(result.totals, { input: 10, output: 4, cacheRead: 2, cacheWrite: 0, total: 14, calls: 1 });
   assert.equal(result.models[0].model, 'model-x');
   assert.equal(result.parseErrors, 1);
   assert.equal('message' in result, false);
+});
+
+test('parses nested cache reads and raw usage cache writes without double-counting reads', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wbs-token-cache-fields-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const now = Date.parse('2026-09-11T10:00:00Z');
+  fs.writeFileSync(path.join(root, 'session.jsonl'), [
+    {
+      timestamp: now,
+      providerData: {
+        model: 'm',
+        usage: { inputTokens: 100, outputTokens: 5, inputTokensDetails: [{ cached_tokens: 7 }] },
+        rawUsage: { prompt_cache_write_tokens: 2 },
+      },
+    },
+    { timestamp: now, model: 'm2', usage: { input_tokens: 10, output_tokens: 1, cache_write_input_tokens: 3 } },
+    { timestamp: now, model: 'm3', usage: { inputTokens: 4, outputTokens: 1, cacheWriteInputTokens: 2 } },
+  ].map(JSON.stringify).join('\n') + '\n');
+  for (const scan of [scanTokenStats, scanTokenStatsCached]) {
+    const result = scan(root, { now, days: 1 });
+    assert.deepEqual(result.totals, { input: 114, output: 7, cacheRead: 7, cacheWrite: 7, total: 128, calls: 3 });
+    assert.equal(result.daily[0].total, 128);
+    assert.equal(result.models[0].total, 107);
+  }
 });
 
 test('cached scan reuses history and merges today without duplicate calls', () => {
@@ -121,7 +145,7 @@ test('token statistics UI keeps results under an overlay and exposes presets thr
   assert.match(source, /if \(!metadata\.cacheReady\)/);
   assert.doesNotMatch(source, /__wbsTokenStatsCacheReady/);
   assert.match(source, /setTimeout\(function \(\) \{ if \(!overlay\.hidden\)/);
-  assert.match(source, /formatTokenCount\(item\.calls/);
+  assert.match(source, /formatTokenCount\(row\.calls/);
   assert.match(source, /usageTimeSegmentHtml\('token'\)/);
   assert.match(source, /usageTimeSegmentHtml\('credit'\)/);
   assert.match(source, /data-' \+ kind \+ '-days="' \+ days/);
@@ -132,6 +156,10 @@ test('token statistics UI keeps results under an overlay and exposes presets thr
   assert.match(source, /data-trend-series/);
   assert.match(source, /stats\.dailyBreakdown/);
   assert.match(source, /renderUsageBreakdown\(creditBody/);
+  assert.match(source, /dayRow\.total == null/);
+  assert.match(source, /item\.total == null/);
+  assert.match(source, /row\.total == null/);
+  assert.match(source, /Token（总量）/);
 });
 
 test('usage statistics modal uses a larger responsive dashboard layout in both themes', () => {
@@ -162,15 +190,28 @@ test('usage statistics modal uses a larger responsive dashboard layout in both t
   assert.match(source, /@media\(max-width:700px\)[\s\S]{0,220}\.wbs-usage-columns\{grid-template-columns:1fr\}/);
 });
 
-test('breakdown lines use distinct chart-only colors across light and dark themes', () => {
+test('usage charts derive all series from WorkBuddy theme tokens', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'inject.js'), 'utf8');
   const colors = source.match(/function usageTrendColors\(\) \{([\s\S]*?)\n    \}/);
   assert.ok(colors);
+  const palette = source.match(/\.wbs-trend-panel,\.wbs-usage-pie-section\{([^}]+)\}/)[1];
+  assert.doesNotMatch(palette, /#[0-9a-f]|rgba?\(/i);
+  assert.match(palette, /--wbs-chart-base:var\(--wbs-credit-theme-color,var\(--wbs-primary\)\)/);
+  assert.match(palette, /--wbs-trend-series-1:var\(--wbs-chart-base\)/);
+  assert.match(palette, /--wbs-trend-series-2:color-mix\(in srgb,var\(--wbs-chart-base\)/);
+  assert.match(palette, /--wbs-trend-series-12:color-mix\(in srgb,var\(--wbs-chart-base\)/);
+  assert.doesNotMatch(palette, /--wb-palette-(blue|purple|green|cyan|red|orange)-5/);
+  assert.match(source, /html\[data-theme="dark"\][\s\S]*--wbs-primary:#7f77dd/);
+  assert.match(source, /--wbs-credit-theme-color:var\(--wb-button-primary-bg\)/);
+  assert.equal((palette.match(/--wbs-trend-series-\d+:/g) || []).length, 12);
+  const chart = source.slice(source.indexOf('function renderUsageTrendChart'), source.indexOf('function usageTimeSegmentHtml'));
+  assert.doesNotMatch(chart, /--wbs-primary|34,197,94|#[0-9a-f]{3,8}/i);
   assert.doesNotMatch(colors[1], /--wbs-primary|--wb-color-text/);
-  assert.match(source, /\.wbs-trend-panel\{--wbs-trend-series-1:#/);
-  assert.match(source, /html\.cb-dark #wbs-token-stats-modal \.wbs-trend-panel/);
-  assert.match(source, /html\[data-theme="dark"\] #wbs-token-stats-modal \.wbs-trend-panel/);
-  assert.match(source, /body\[data-vscode-theme-name\*="dark" i\] #wbs-token-stats-modal \.wbs-trend-panel/);
+  assert.match(source, /getComputedStyle\(panel\)\.getPropertyValue\('--wbs-trend-series-1'\)/);
+  assert.match(source, /series = series\.map\(function \(line\)/);
+  assert.match(source, /resolveUsageColor\(line\.color, container\)/);
+  assert.doesNotMatch(source, /\.wbs-pie-legend\{[^}]*max-height/);
+  assert.doesNotMatch(source, /\.wbs-token-model-scroll\{[^}]*max-height/);
   assert.match(source, /state\.colorSlots\[mode\]/);
   assert.match(source, /slots\.delete\(key\)/);
   assert.match(source, /new Set\(groups\.map\(function \(group\) \{ return group\.key; \}\)\)/);
@@ -241,4 +282,18 @@ test('seven-day totals match calendar dates and ignore diagnostic copies', t => 
   assert.equal(stats.totals.calls, 3);
   assert.equal(stats.totals.input, 32);
   assert.deepEqual(stats.daily.map(x => x.day), ['2026-09-07', '2026-09-12', '2026-09-13']);
+});
+
+test('native request indexes count usage once across copies and cache no message content',t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'codedaddy-stats-'));
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const now=Date.now(),files=['a.json','b.json'].map(name=>path.join(root,name));
+  const request={id:'request',startedAt:now-1000,messages:['private-content'],usage:{inputTokens:9,outputTokens:4,cacheTokens:2,cachedWriteTokens:1}};
+  for(const file of files)fs.writeFileSync(file,JSON.stringify({requests:[request]},null,2));
+  const options={now,files,readRecords:text=>JSON.parse(text).requests,sourceSession:()=> 'source',sessionAccounts:{source:'account'}};
+  const result=scanTokenStatsCached(root,options);
+  assert.deepEqual(result.totals,{input:9,output:4,cacheRead:2,cacheWrite:1,total:14,calls:1});
+  assert.equal(result.accounts[0].account,'account');
+  assert.equal(scanTokenStatsCached(root,options).totals.calls,1);
+  assert.ok(!fs.readFileSync(path.join(root,'.workdaddy-token-stats-cache.json'),'utf8').includes('private-content'));
 });

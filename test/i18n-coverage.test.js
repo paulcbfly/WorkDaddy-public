@@ -153,6 +153,9 @@ test('runtime translation: typical concatenated sentences yield pure English (no
     '剩余时间计算中',
     '基础用量 500',
     '账号汇总 · 总积分 100',
+    // /api/switch 未触发 CDP reload 时的兜底 hint（codebuddy 原生切换即时生效，无需重启）
+    '原生登录态已切换，无需重启客户端',
+    '登录文件已切换，请刷新窗口使新账号生效',
   ];
   for (const input of cases) {
     const out = t(input, 'en');
@@ -176,6 +179,13 @@ test('short keys cannot shred longer covered sentences', () => {
 test('attribute whitelist includes alt and data-tip; observer watches them', () => {
   assert.match(inject, /'title', 'aria-label', 'placeholder', 'alt', 'data-tip'/);
   assert.match(inject, /attributeFilter: \['title', 'aria-label', 'placeholder', 'alt', 'data-tip'\]/);
+});
+
+test('switch fallback toast prefers the daemon hint over the generic restart message', () => {
+  // codebuddy 走原生会话替换（即时生效，无需重启/刷新），WorkBuddy 文件替换在 CDP
+  // 刷新失败时也只需"刷新窗口"。toast 必须优先用 daemon 的 hint，否则 codebuddy
+  // 下会误报"重启后生效"。
+  assert.match(inject, /: \(r\.hint \|\| '已切换为「' \+ \(r\.nickname \|\| r\.uid\) \+ '」，重启后生效'\)/);
 });
 
 test('variant keys: error prefixes with and without trailing space both translate', () => {

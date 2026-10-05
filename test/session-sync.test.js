@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { readSnapshot, readSnapshotAsync, readSessionFingerprintAsync, readSessionQuickFingerprintAsync, compareSnapshots, applySnapshot, applySnapshotAsync } = require('../scripts/session-sync.js');
+const { readSnapshot, readSnapshotAsync, readSessionFingerprintAsync, readSessionQuickFingerprintAsync, compareSnapshots, applySnapshot, applySnapshotAsync, pruneSyncBackups, inspectSyncBackups } = require('../scripts/session-sync.js');
 
 const message = (role, text) => ({ type: 'message', role, content: [{ type: 'text', text }] });
 const base = [message('user', 'question'), message('assistant', 'answer')];
@@ -91,6 +91,52 @@ test('only identity fields normalize; literal session IDs inside messages remain
   assert.equal(compareSnapshots(f.read('a'), f.read('b')).kind, 'conflict');
 });
 
+for (const asynchronous of [false, true]) {
+  test(`${asynchronous ? 'async' : 'sync'} copies bind transcript runtime identity to the destination`, async t => {
+    const f = fixture(t);
+    const records = [
+      { type: 'session-meta', sessionId: 'a', id: 'activation' },
+      { ...message('user', 'literal a'), sessionId: 'a', id: 'message-a' },
+      { type: 'function_call', sessionId: 'c', id: 'tool-a', name: 'AskUserQuestion',
+        arguments: { sessionId: 'a', question: 'literal a' } },
+      { type: 'function_call_result', sessionId: 'a', call_id: 'tool-a', output: { sessionId: 'a' } },
+      { ...message('assistant', 'child result'), sessionId: 'unrelated-child' },
+    ];
+    f.write('a', records);
+    const read = asynchronous ? id => readSnapshotAsync(f.root, id, ['a', 'b', 'c']) : f.read;
+    const apply = asynchronous ? applySnapshotAsync : applySnapshot;
+    await apply(await read('a'), await read('b'), { backupRoot: path.join(f.root, 'backups') });
+    const copied = fs.readFileSync(f.file('b'), 'utf8').trim().split('\n').map(JSON.parse);
+    assert.deepEqual(copied, records.map(record => ({
+      ...record, sessionId: ['a', 'c'].includes(record.sessionId) ? 'b' : record.sessionId,
+    })), 'resume must use B for steer/permission routing without rewriting message IDs or tool payloads');
+    assert.equal(compareSnapshots(await read('a'), await read('b')).kind, 'equal');
+    assert.deepEqual(fs.readFileSync(f.file('a'), 'utf8').trim().split('\n').map(JSON.parse), records);
+  });
+}
+
+test('legacy runtime identity repair keeps the target continuation and rolls back on failure', async t => {
+  const f = fixture(t);
+  const records = [...base, message('user', 'B-only continuation')].map(row => ({ ...row, sessionId: 'a' }));
+  f.write('b', records);
+  const before = fs.readFileSync(f.file('b'));
+  const repair = require('../scripts/session-sync.js').repairRuntimeIdentity;
+  const options = { backupRoot: path.join(f.root, 'backups') };
+  await assert.rejects(repair(await readSnapshotAsync(f.root, 'b', ['a', 'b']), {
+    ...options, commit: async () => { throw Error('commit rejected'); },
+  }), /commit rejected/);
+  assert.deepEqual(fs.readFileSync(f.file('b')), before);
+  await assert.rejects(repair(await readSnapshotAsync(f.root, 'b', ['a', 'b']), {
+    ...options, guard: async () => { throw Error('busy'); },
+  }), /busy/);
+  assert.deepEqual(fs.readFileSync(f.file('b')), before);
+  const result = await repair(await readSnapshotAsync(f.root, 'b', ['a', 'b']), options);
+  assert.equal(result.copied, 1);
+  assert.deepEqual(fs.readFileSync(f.file('b'), 'utf8').trim().split('\n').map(JSON.parse),
+    records.map(row => ({ ...row, sessionId: 'b' })));
+  assert.equal((await repair(await readSnapshotAsync(f.root, 'b', ['a', 'b']), options)).copied, 0);
+});
+
 test('activation-only session-meta records do not conflict across account copies', t => {
   const f = fixture(t);
   const stable = { type: 'session-meta', meta: { 'codebuddy.ai/hostKind': 'unopted' } };
@@ -106,6 +152,25 @@ test('an activation-only session-meta append does not become an imported continu
   f.write('b', [...base, { ...stable, id: 'event-b', sessionId: 'b', timestamp: 200 }]);
   assert.equal(compareSnapshots(f.read('b'), f.read('a')).kind, 'equal');
 });
+
+test('different session-meta counts do not shift the real transcript sequence', t => {
+  const f = fixture(t);
+  const stable = { type: 'session-meta', meta: { 'codebuddy.ai/hostKind': 'unopted' } };
+  const continuation = [message('user', 'continued'), message('assistant', 'reply')];
+  f.write('a', [
+    ...base,
+    { ...stable, id: 'a-1', sessionId: 'a', timestamp: 100 },
+    { ...stable, id: 'a-2', sessionId: 'a', timestamp: 101 },
+    ...continuation,
+  ]);
+  f.write('b', [
+    ...base,
+    { ...stable, id: 'b-1', sessionId: 'b', timestamp: 200 },
+    ...continuation,
+  ]);
+  assert.equal(compareSnapshots(f.read('a'), f.read('b')).kind, 'equal');
+});
+
 test('missing payload is repairable and symlinked files are skipped without following them', async t => {
   const f = fixture(t); f.write('a', base);
   assert.equal(compareSnapshots(f.read('a'), f.read('b')).kind, 'left-extends');
@@ -212,6 +277,45 @@ test('async snapshots stream large transcripts and publication keeps the event l
   assert.ok(ticks > 0, 'large sync must yield to daemon HTTP and renderer work');
 });
 
+test('async successful update removes its rollback backup', async t => {
+  const f = fixture(t); f.write('a', base); f.write('b', [...base, message('user', 'next')]);
+  const backupRoot = path.join(f.root, 'backups');
+  const result = await applySnapshotAsync(
+    await readSnapshotAsync(f.root, 'b', ['a', 'b']),
+    await readSnapshotAsync(f.root, 'a', ['a', 'b']),
+    { backupRoot }
+  );
+  assert.equal(fs.existsSync(result.backup), false);
+  assert.deepEqual(fs.readdirSync(backupRoot), []);
+});
+
+test('async rollback backup contains only target files changed by the sync', async t => {
+  const f = fixture(t);
+  f.write('a', base); f.write('b', [...base, message('user', 'next')]);
+  for (const id of ['a', 'b']) {
+    const file = path.join(f.root, 'workspace', 'sessions', id, 'editor-settings.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{"enabled":true}\n');
+  }
+  const backupRoot = path.join(f.root, 'backups');
+  await assert.rejects(applySnapshotAsync(
+    await readSnapshotAsync(f.root, 'b', ['a', 'b']),
+    await readSnapshotAsync(f.root, 'a', ['a', 'b']),
+    {
+      backupRoot,
+      commit: async () => {
+        fs.writeFileSync(f.file('a'), 'official write');
+        throw Error('DB failure');
+      },
+    }
+  ), /DB failure/);
+  const backups = fs.readdirSync(backupRoot);
+  assert.equal(backups.length, 1);
+  const files = fs.readdirSync(path.join(backupRoot, backups[0], 'files', 'projects', 'project'));
+  assert.deepEqual(files, ['__session__.jsonl']);
+  assert.equal(fs.existsSync(path.join(backupRoot, backups[0], 'files', 'workspace')), false);
+});
+
 test('async publication rolls back commit failures without overwriting concurrent official writes', async t => {
   const f = fixture(t);
   f.write('a', [...base, message('user', 'continued')]);
@@ -242,17 +346,93 @@ test('equal messages repair missing supporting files but conflicting supporting 
   fs.mkdirSync(path.dirname(aux('b')), { recursive: true }); fs.writeFileSync(aux('b'), 'different');
   assert.equal(compareSnapshots(f.read('a'), f.read('b')).kind, 'conflict');
 });
-test('update retains a backup, validates bytes, and never changes a third copy', async t => {
+test('successful update removes its rollback backup and never changes a third copy', async t => {
   const f = fixture(t); f.write('a', base); f.write('b', [...base, message('user', 'next')]); f.write('c', base);
   const original = fs.readFileSync(f.file('a')); let committed = false;
+  const backupRoot = path.join(f.root, 'backups');
   const result = await applySnapshot(f.read('b'), f.read('a'), {
-    backupRoot: path.join(f.root, 'backups'), metadata: { id: 'a', title: 'old' },
+    backupRoot, metadata: { id: 'a', title: 'old' },
     commit: async () => { committed = true; },
   });
   assert.equal(committed, true);
   assert.deepEqual(fs.readFileSync(f.file('a')), fs.readFileSync(f.file('b')));
   assert.deepEqual(fs.readFileSync(f.file('c')), original);
-  assert.deepEqual(fs.readFileSync(path.join(result.backup, 'files', 'projects', 'project', '__session__.jsonl')), original);
+  assert.equal(fs.existsSync(result.backup), false);
+  assert.deepEqual(fs.readdirSync(backupRoot), []);
+});
+
+test('rollback backup contains only target files changed by the sync', async t => {
+  const f = fixture(t);
+  f.write('a', base); f.write('b', [...base, message('user', 'next')]);
+  for (const id of ['a', 'b']) {
+    const file = path.join(f.root, 'workspace', 'sessions', id, 'editor-settings.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{"enabled":true}\n');
+  }
+  const backupRoot = path.join(f.root, 'backups');
+  await assert.rejects(applySnapshot(f.read('b'), f.read('a'), {
+    backupRoot,
+    commit: async () => {
+      // Simulate a concurrent official write after publication. The rollback
+      // must retain its backup so the recovery case is inspectable.
+      fs.writeFileSync(f.file('a'), 'official write');
+      throw Error('DB failure');
+    },
+  }), /DB failure/);
+  const backups = fs.readdirSync(backupRoot);
+  assert.equal(backups.length, 1);
+  const backupFiles = [];
+  const visit = (directory, relative = '') => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const next = relative ? path.join(relative, entry.name) : entry.name;
+      if (entry.isDirectory()) visit(path.join(directory, entry.name), next);
+      else if (next !== 'journal.json') backupFiles.push(next);
+    }
+  };
+  visit(path.join(backupRoot, backups[0], 'files'));
+  assert.deepEqual(backupFiles, [path.join('projects', 'project', '__session__.jsonl')]);
+});
+
+test('backup pruning removes completed and stale crash journals but keeps recovery-needed data', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-sync-prune-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const now = 10_000_000;
+  const make = (name, status, age) => {
+    const dir = path.join(root, name); fs.mkdirSync(dir, { recursive: true });
+    if (status !== null) fs.writeFileSync(path.join(dir, 'journal.json'), JSON.stringify({ status }));
+    fs.utimesSync(dir, new Date(now - age), new Date(now - age));
+  };
+  make('sync-committed', 'committed', 0);
+  make('sync-rolled-back', 'rolled-back', 0);
+  make('sync-prepared-old', 'prepared', 31 * 24 * 60 * 60 * 1000);
+  make('sync-prepared-new', 'prepared', 1_000);
+  make('sync-recovery', 'recovery-needed', 365 * 24 * 60 * 60 * 1000);
+  make('sync-malformed-old', null, 31 * 24 * 60 * 60 * 1000);
+  const result = pruneSyncBackups(root, { now, maxAgeMs: 30 * 24 * 60 * 60 * 1000 });
+  assert.equal(result.removed, 4);
+  assert.equal(result.retainedRecovery, 1);
+  assert.equal(fs.existsSync(path.join(root, 'sync-prepared-new')), true);
+  assert.equal(fs.existsSync(path.join(root, 'sync-recovery')), true);
+});
+
+test('backup inspection reports bytes and recovery-needed count without reading payloads', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wbs-backup-inspect-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const backupRoot = path.join(root, 'backups');
+  const recovery = path.join(backupRoot, 'sync-recovery');
+  const prepared = path.join(backupRoot, 'sync-prepared');
+  fs.mkdirSync(path.join(recovery, 'files'), { recursive: true });
+  fs.mkdirSync(path.join(prepared, 'files'), { recursive: true });
+  fs.writeFileSync(path.join(recovery, 'files', 'old.jsonl'), '12345');
+  fs.writeFileSync(path.join(prepared, 'files', 'pending.jsonl'), '12');
+  fs.writeFileSync(path.join(recovery, 'journal.json'), JSON.stringify({ status: 'recovery-needed' }));
+  fs.writeFileSync(path.join(prepared, 'journal.json'), JSON.stringify({ status: 'prepared' }));
+  const stats = inspectSyncBackups(backupRoot);
+  assert.equal(stats.count, 2);
+  assert.equal(stats.recoveryCount, 1);
+  assert.equal(stats.pendingCount, 1);
+  assert.equal(stats.recoveryBytes, 5 + Buffer.byteLength('{"status":"recovery-needed"}'));
+  assert.equal(stats.totalBytes, stats.recoveryBytes + 2 + Buffer.byteLength('{"status":"prepared"}'));
 });
 test('failed commit restores target bytes; source changes abort before publication', async t => {
   const f = fixture(t); f.write('a', base); f.write('b', [...base, message('user', 'next')]);

@@ -57,7 +57,8 @@ test('session and account selectors escape every text and attribute sink', () =>
   const sessions = sourceBetween('function renderSessions()', 'function activeAutoCopyCount()');
   assert.equal((sessions.match(/escAttr\(key\)/g) || []).length, 1);
   assert.equal((sessions.match(/escAttr\(uid\)/g) || []).length, 1);
-  assert.equal((sessions.match(/escAttr\(s\.id\)/g) || []).length, 2);
+  // 2 处勾选框 + 1 处行内单条同步按钮（[会话单条同步]），均经 escAttr
+  assert.equal((sessions.match(/escAttr\(s\.id\)/g) || []).length, 3);
   assert.equal((sessions.match(/esc\(title\)/g) || []).length, 2);
   assert.equal((sessions.match(/esc\(fmtHumanTime\(/g) || []).length, 2);
   assert.match(sessions, /title="' \+ escAttr\(group\.cwd\)/);
@@ -86,7 +87,7 @@ test('model, wallpaper, and account cards escape each dynamic HTML sink', () => 
   assert.doesNotMatch(wallpapers, /(?:data-wp|title|data-src|alt)="' \+ (?:w\.|wallpaperUrl)/);
 
   const accounts = sourceBetween('function render(data)', 'function updateAccountSummary()');
-  assert.equal((accounts.match(/escAttr\(a\.uid\)/g) || []).length, 2);
+  assert.equal((accounts.match(/escAttr\(a\.uid\)/g) || []).length, 3);
   assert.doesNotMatch(accounts, /data-primary-uid/);
   assert.equal((accounts.match(/escAttr\(a\.nickname \|\| '未命名'\)/g) || []).length, 2);
   assert.match(accounts, /var nameVal = state\.mask \? maskAccountName\(rawName\) : rawName;/);

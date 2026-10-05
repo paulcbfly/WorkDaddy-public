@@ -8,7 +8,7 @@ const path = require('node:path');
 const inject = fs.readFileSync(path.join(__dirname, '../scripts/inject.js'), 'utf8');
 const daemon = fs.readFileSync(path.join(__dirname, '../scripts/daemon.js'), 'utf8');
 
-test('account cards render task progress as a cat liquid badge before check-in status', () => {
+test('account cards render today check-in as a full or empty cat liquid badge', () => {
   assert.match(inject, /wbs-daily-rings/);
   assert.match(inject, /wbs-daily-vessel/);
   assert.match(inject, /wbs-daily-liquid/);
@@ -28,6 +28,11 @@ test('account cards render task progress as a cat liquid badge before check-in s
   assert.match(inject, /\.wbs-daily-rings\{[^}]*border:0/);
   assert.match(inject, /wbs-daily-streak-label/);
   assert.match(inject, /连续登录 /);
+  assert.match(inject, /function isCheckedInToday\(a\)/);
+  assert.match(inject, /var level = checkedToday \? '100\.00%' : '0\.00%'/);
+  assert.match(inject, /is-checked-in/);
+  assert.match(inject, /\.wbs-daily-vessel\.is-empty \.wbs-daily-liquid\{min-height:0\}/);
+  assert.doesNotMatch(inject.slice(inject.indexOf('function dailyRingsSvg('), inject.indexOf('function dailyRingsHtml(', inject.indexOf('function dailyRingsSvg('))), /growth\.ratio/);
   assert.doesNotMatch(inject, />活跃 .* 天</);
   assert.match(inject, /\.wbs-daily-vessel\{[^}]*border-radius:50%/);
   assert.match(inject, /\.wbs-daily-liquid\{[^}]*height:var\(--wbs-liquid-level/);
@@ -36,6 +41,34 @@ test('account cards render task progress as a cat liquid badge before check-in s
   const hoverRule = inject.match(/\.wbs-daily-rings:hover[^']+/);
   assert.ok(hoverRule);
   assert.doesNotMatch(hoverRule[0], /border(?:-color)?:/);
+});
+
+test('cat water requires the official growth record for today, not credit check-in or streak totals', () => {
+  const start = inject.indexOf('    function dailyRingsSvg(account)');
+  const end = inject.indexOf('\n    function dailyRingsHtml', start);
+  const vm = require('node:vm');
+  const context = {
+    WORKBUDDY_CAT_MARK: '__WBS_BUDDY_MARK__',
+    Date: class extends Date { static now() { return Date.parse('2026-09-30T02:00:00Z'); } },
+  };
+  const checkedStart = inject.indexOf('  function isCheckedInToday(');
+  vm.runInNewContext(inject.slice(checkedStart, inject.indexOf('  function activityStreakHtml(', checkedStart)), context);
+  vm.runInNewContext(inject.slice(start, end), context);
+  const record = (is_active, date = '2026-09-30') => ({ ok: true, is_active, date });
+  for (const account of [
+    { checkin: { ok: true } },
+    { checkin: { ok: true }, growthTodayActive: record(false) },
+    { checkin: { ok: true }, growthTodayActive: record(true, '2026-09-29') },
+    { activityStreak: { days: 5, status: 'ready' }, dailyProgress: { growth: { ratio: 1 } } },
+    { growthTodayActive: { ok: false, is_active: true, date: '2026-09-30' } },
+    { growthTodayActive: record('true') },
+    {}, null,
+  ]) assert.match(context.dailyRingsSvg(account), /is-empty/, JSON.stringify(account));
+  const completed = { checkin: { ok: false }, growthTodayActive: record(true) };
+  assert.match(context.dailyRingsSvg(completed), /is-checked-in/);
+  assert.match(context.dailyRingsSvg(completed), /--wbs-liquid-level:100\.00%/);
+  context.Date = class extends Date { static now() { return Date.parse('2026-09-30T16:00:00Z'); } };
+  assert.match(context.dailyRingsSvg(completed), /is-empty/, 'yesterday must become empty at Beijing midnight');
 });
 
 test('daily activity and credit nodes reuse one theme-aware colored popover', () => {
@@ -148,28 +181,60 @@ test('growth primary is green in light and blue-purple in dark, cyber, and glass
   assert.match(inject, /\.wbs-growth-tier b\{[^}]*color:var\(--wb-color-text-secondary/);
 });
 
+test('growth status colors reuse WorkBuddy primary theme constants', () => {
+  const vars = inject.match(/\.wbs-daily-rings,\.wbs-status-popover\{[^']+/);
+  assert.ok(vars);
+  assert.match(vars[0], /--wbs-ring-growth:var\(--wb-button-primary-bg/);
+  assert.match(vars[0], /--wbs-ring-cat:var\(--wb-button-primary-bg/);
+  assert.match(vars[0], /--wbs-tip-credit:var\(--wb-button-primary-bg/);
+  assert.match(vars[0], /--wbs-liquid-fill:var\(--wb-button-primary-bg/);
+  assert.match(inject, /\.wbs-session-copy-icon\{[^}]*var\(--wb-button-primary-bg/);
+  assert.doesNotMatch(inject, /\.wbs-session-copy-summary-line\.is-copied\{color:#238a5b/);
+});
+
 test('growth actions open the official center and never write through local growth routes', async () => {
-  assert.match(inject, /https:\/\/www\.workbuddy\.cn\/profile\/growth-center/);
+  assert.match(inject, /profile\/growth-center\?fromSource=gwzcw\.15291246/);
+  assert.match(inject, /\/console\/client-login\?code=/);
+  assert.match(inject, /request-device-auth-code-result/);
   assert.match(inject, /data-wbs-growth-official/);
   assert.match(inject, /api\('\/api\/open-url'/);
   assert.match(inject, /\/api\/growth\/daily-progress/);
-  const source = inject.match(/function openOfficialGrowthCenter\(\) \{[\s\S]*?\n    \}/);
-  assert.ok(source);
-  const calls = [];
-  const open = Function('api', 'toast', 'root', source[0] + '\nreturn openOfficialGrowthCenter;')(
+  const helperStart = inject.indexOf('    var OFFICIAL_GROWTH_TARGET');
+  const helperEnd = inject.indexOf('    function confirmCurrentGrowthAccount', helperStart);
+  assert.ok(helperStart > 0 && helperEnd > helperStart);
+  const source = inject.slice(helperStart, helperEnd);
+  const calls = [], listeners = {};
+  const adapter = {
+    on(event, handler) { listeners[event] = handler; return () => { delete listeners[event]; }; },
+    emit(event) { assert.equal(event, 'request-device-auth-code'); setImmediate(() => listeners['request-device-auth-code-result']({ success: true, deviceCode: 'device-123' })); },
+    openExternal(url) { calls.push({ route: 'openExternal', url }); return Promise.resolve(); },
+  };
+  const open = Function('api', 'toast', 'root', 'findWbsAdapter', 'window', 'PROFILE_ID', source + '\nreturn openOfficialGrowthCenter;')(
     (route, options) => { calls.push({ route, options }); return Promise.resolve(); },
     () => assert.fail('opening the official site should not toast success'),
-    {}
+    {}, () => adapter, { __wbsAdapter: adapter }, 'workbuddy-cn'
   );
-  open();
+  await open();
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].route, '/api/open-url');
-  assert.deepEqual(JSON.parse(calls[0].options.body), { url: 'https://www.workbuddy.cn/profile/growth-center' });
-  await Promise.resolve();
+  assert.equal(calls[0].route, 'openExternal');
+  const opened = new URL(calls[0].url);
+  assert.equal(opened.origin, 'https://www.workbuddy.cn');
+  assert.equal(opened.pathname, '/console/client-login');
+  assert.equal(opened.searchParams.get('code'), 'device-123');
+  assert.match(opened.searchParams.get('target'), /^\/profile\/growth-center\?fromSource=gwzcw\.15291246/);
   for (const suffix of ['tasks/accept', 'tasks/accept-all', 'buddy/first', 'buddy/travel/claim', 'buddy/select', 'buddy/travel/depart', 'buddy/open', 'lottery/draw']) {
     assert.doesNotMatch(inject, new RegExp('/api/growth/' + suffix));
     assert.doesNotMatch(daemon, new RegExp("p === '/api/growth/" + suffix + "'"));
   }
+});
+
+test('modern adapter shim forwards the official login event and external-open methods', () => {
+  const start = inject.indexOf('    function findWbsAdapter()');
+  const end = inject.indexOf('    function bootstrapModernQueueBridge()', start);
+  assert.ok(start > 0 && end > start);
+  const adapterSource = inject.slice(start, end);
+  assert.match(adapterSource, /\['on', 'emit', 'openExternal'\]/);
+  assert.match(adapterSource, /target\[m\]\.apply\(target, arguments\)/);
 });
 
 test('growth window buttons use the live current account and leave other accounts untouched', async () => {
@@ -253,6 +318,24 @@ test('daily labels share a black light treatment and one glass dark treatment', 
   assert.match(inject, /backdrop-filter:blur\(12px\)/);
 });
 
+test('cat water follows the credit or button palette for the selected theme', () => {
+  const badgeRules = [...inject.matchAll(/\.wbs-daily-rings\{([^}]+)\}/g)]
+    .map(match => match[1]).filter(rule => rule.includes('--wbs-liquid-fill:'));
+  assert.ok(badgeRules.length);
+  for (const rule of badgeRules) {
+    assert.match(rule, /--wbs-liquid-fill:(?:color-mix\(in srgb,var\(--wb-button-primary-bg|oklch\(from var\(--wb-button-primary-bg|var\(--wbs-credit-theme-color,var\(--wbs-primary\)\))/);
+  }
+  assert.match(inject, /\.wbs-daily-vessel\.is-checked-in\{--wbs-liquid-ink:var\(--wb-button-primary-fg/);
+  const fullVessel = inject.match(/\.wbs-daily-vessel\.is-checked-in\{([^}]+)\}/);
+  const fullLiquid = inject.match(/\.wbs-daily-vessel\.is-checked-in \.wbs-daily-liquid\{([^}]+)\}/);
+  assert.ok(fullVessel);
+  assert.ok(fullLiquid);
+  assert.match(fullVessel[1], /background:var\(--wbs-liquid-fill\)/);
+  assert.match(fullVessel[1], /box-shadow:none/);
+  assert.match(fullLiquid[1], /box-shadow:none/);
+  assert.match(fullLiquid[1], /border-radius:inherit/);
+});
+
 test('travel selection links to the official center', () => {
   assert.match(inject, /cat\.state === 'needs_selection'/);
   assert.match(inject, /去官网选择 Buddy/);
@@ -275,4 +358,26 @@ test('travel countdown formats a live arrival time without dropping hours or zer
   assert.equal(format(now + 3_723_000, now), '1小时 02分 03秒');
   assert.equal(format(now + 65_000, now), '01分 05秒');
   assert.equal(format(now, now), '');
+});
+
+test('growth plan primary actions use WorkBuddy button theme tokens', () => {
+  const action = inject.match(/\.wbs-growth-task-action\{[^']+/);
+  assert.ok(action, 'growth action style exists');
+  assert.match(action[0], /var\(--wb-button-primary-bg/);
+  assert.match(action[0], /var\(--wb-button-primary-fg/);
+  assert.doesNotMatch(action[0], /color:var\(--wbs-ring-growth\)/);
+  const hover = inject.match(/\.wbs-growth-task-action:hover[^']+/);
+  assert.ok(hover);
+  assert.match(hover[0], /var\(--wb-button-primary-bg-hover/);
+});
+
+
+test('full water remains visibly brighter than the empty vessel in monochrome themes', () => {
+  assert.match(inject, /--wbs-liquid-fill:color-mix\(in srgb,var\(--wb-button-primary-bg\) 55%,var\(--wb-button-primary-fg\)\)/);
+  assert.match(inject, /@supports \(color:oklch\(from black l c h\)\)\{\.wbs-daily-rings\{--wbs-liquid-fill:oklch\(from var\(--wb-button-primary-bg\) max\(l,\.62\) c h \/ 1\)/);
+});
+
+
+test('default light cat highlight shares the credit progress color and excludes dark themes', () => {
+  assert.ok(inject.includes('html:not(.cb-dark):not([data-theme="dark"]):is([data-wbs-theme-id="default"],:not([data-wbs-theme-id])) body:not([data-vscode-theme-name*="dark" i]) .wbs-daily-rings{--wbs-liquid-fill:var(--wbs-credit-theme-color,var(--wbs-primary))}'));
 });
